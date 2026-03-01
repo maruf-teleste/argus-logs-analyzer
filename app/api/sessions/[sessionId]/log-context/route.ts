@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { executeTool } from "@/lib/query/tools-registry";
-import { pool } from "@/lib/db/batch-client";
+import { db } from "@/lib/db";
 
 export async function GET(
   req: NextRequest,
@@ -13,7 +13,6 @@ export async function GET(
     const thread = req.nextUrl.searchParams.get("thread");
     const fileIdParam = req.nextUrl.searchParams.get("fileId");
 
-    // Validate required parameters
     if (!lineNumber) {
       return NextResponse.json(
         { error: "lineNumber query param is required" },
@@ -26,27 +25,21 @@ export async function GET(
     if (fileIdParam) {
       fileId = parseInt(fileIdParam, 10);
     } else {
-      // Get first file from session
-      const result = await pool.query(
-        `SELECT file_id FROM session_files WHERE session_id = $1 LIMIT 1`,
-        [sessionId]
-      );
-
-      if (result.rows.length === 0) {
+      const id = db.getFirstFileId(sessionId);
+      if (id === null) {
         return NextResponse.json(
           { error: "No files found in this session" },
           { status: 404 }
         );
       }
-
-      fileId = result.rows[0].file_id;
+      fileId = id;
     }
 
     // Step 1: Get the anchor log to extract its timestamp
     const anchorLog = await executeTool("get_log_by_line_number", {
       file_id: fileId,
       line_number: parseInt(lineNumber, 10),
-      context_lines: 0, // Only fetch the anchor log itself
+      context_lines: 0,
     });
 
     if (!anchorLog || anchorLog.length === 0 || !anchorLog[0]?.timestamp) {
@@ -60,11 +53,10 @@ export async function GET(
     const anchorLineNumber = parseInt(lineNumber, 10);
 
     // Step 2: Fetch balanced context (N logs before + anchor + N logs after)
-    // contextLines is now the COUNT of logs before/after (default 10 = 10 before + 10 after)
     const rawLogs = await executeTool("get_time_based_context", {
       file_id: fileId,
       anchor_timestamp: anchorTimestamp,
-      time_window_seconds: parseInt(contextLines, 10), // Actually used as count limit
+      time_window_seconds: parseInt(contextLines, 10),
       thread: thread && thread !== "null" && thread !== "undefined" ? thread : undefined,
       anchor_line_number: anchorLineNumber,
     });
@@ -88,7 +80,7 @@ export async function GET(
       note: `Showing ${contextLines} logs before and ${contextLines} logs after the anchor (balanced view)`,
     });
   } catch (err) {
-    console.error("❌ Log context query failed:", err);
+    console.error("Log context query failed:", err);
     return NextResponse.json(
       { error: "Failed to fetch log context" },
       { status: 500 }

@@ -1,37 +1,6 @@
 // lib/ai/duckdb-api.ts
-// Auto-generated API client that syncs with tools-registry.ts
-// No need to manually add functions - just use callTool()
+import { executeTool } from '@/lib/query/tools-registry';
 
-const BASE_URL = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
-
-// ============================================================
-// CORE FETCH WRAPPER
-// ============================================================
-async function callDuckDB(action: string, params: any): Promise<any> {
-  const response = await fetch(`${BASE_URL}/api/query/duckdb`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, params }),
-  });
-
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || "DuckDB query failed");
-  }
-
-  return response.json();
-}
-
-// ============================================================
-// GENERIC TOOL CALLER - Use this instead of individual functions
-// ============================================================
-export async function callTool(action: string, params: any): Promise<any> {
-  return callDuckDB(action, params);
-}
-
-// ============================================================
-// CONVENIENCE WRAPPERS (Optional - for better type safety)
-// ============================================================
 
 export async function detectAnomalies(
   fileId: number,
@@ -44,7 +13,7 @@ export async function detectAnomalies(
     severityFilter?: string[];
   }
 ) {
-  return callTool("detect_anomalies", {
+  return executeTool("detect_anomalies", {
     file_id: fileId,
     problem_start: problemStart,
     problem_end: problemEnd,
@@ -65,7 +34,7 @@ export async function getPatternExamples(
     includeContext?: boolean;
   }
 ) {
-  return callTool("get_pattern_examples", {
+  return executeTool("get_pattern_examples", {
     file_id: fileId,
     fingerprint,
     time_start: options?.timeStart,
@@ -81,7 +50,7 @@ export async function getCorrelatedEvents(
   correlationType: "thread" | "trace_id" | "time_window" | "component",
   windowSeconds?: number
 ) {
-  return callTool("get_correlated_events", {
+  return executeTool("get_correlated_events", {
     file_id: fileId,
     anchor_line: anchorLine,
     correlation_type: correlationType,
@@ -90,11 +59,11 @@ export async function getCorrelatedEvents(
 }
 
 export async function getFileOverview(fileId: number) {
-  return callTool("get_file_overview", { file_id: fileId });
+  return executeTool("get_file_overview", { file_id: fileId });
 }
 
 export async function getLogs(fileId: number, options?: any) {
-  return callTool("get_logs", { file_id: fileId, options });
+  return executeTool("get_logs", { file_id: fileId, options });
 }
 
 export async function getThreadContext(
@@ -103,7 +72,7 @@ export async function getThreadContext(
   lineNumber: number,
   contextLines?: number
 ) {
-  return callTool("get_thread_context", {
+  return executeTool("get_thread_context", {
     file_id: fileId,
     thread,
     line_number: lineNumber,
@@ -112,7 +81,7 @@ export async function getThreadContext(
 }
 
 export async function getErrorsWithStackTraces(fileId: number, options?: any) {
-  return callTool("get_errors_with_stack_traces", {
+  return executeTool("get_errors_with_stack_traces", {
     file_id: fileId,
     options,
   });
@@ -123,7 +92,7 @@ export async function getLogByLineNumber(
   lineNumber: number,
   contextLines?: number
 ) {
-  return callTool("get_log_by_line_number", {
+  return executeTool("get_log_by_line_number", {
     file_id: fileId,
     line_number: lineNumber,
     context_lines: contextLines,
@@ -131,22 +100,26 @@ export async function getLogByLineNumber(
 }
 
 export async function getExceptionSummary(fileId: number) {
-  return callTool("get_exception_summary", { file_id: fileId });
+  return executeTool("get_exception_summary", { file_id: fileId });
+}
+
+export async function getFailingDevices(fileId: number) {
+  return executeTool("get_failing_devices", { file_id: fileId });
 }
 
 export async function getTimeSeries(fileId: number, options?: any) {
-  return callTool("get_time_series", { file_id: fileId, options });
+  return executeTool("get_time_series", { file_id: fileId, options });
 }
 
 export async function getDeviceSummary(fileId: number, deviceId: string) {
-  return callTool("get_device_summary", {
+  return executeTool("get_device_summary", {
     file_id: fileId,
     device_id: deviceId,
   });
 }
 
 export async function getSeverityCounts(fileId: number) {
-  return callTool("get_severity_counts", { file_id: fileId });
+  return executeTool("get_severity_counts", { file_id: fileId });
 }
 
 export async function searchAcrossFiles(
@@ -157,15 +130,15 @@ export async function searchAcrossFiles(
     limit?: number;
   }
 ) {
-  return callTool("search_across_files", {
+  return executeTool("search_across_files", {
     file_ids: fileIds,
     search_text: searchText,
     options,
-  });
+});
 }
 
 export async function getTimelineHistogram(fileId: number) {
-  return callTool("get_timeline_histogram", { file_id: fileId });
+  return executeTool("get_timeline_histogram", { file_id: fileId });
 }
 
 export async function getAnomalyGrid(
@@ -178,7 +151,7 @@ export async function getAnomalyGrid(
     offset?: number;
   }
 ) {
-  return callTool("get_anomaly_grid", {
+  return executeTool("get_anomaly_grid", {
     file_id: fileId,
     start_time: startTime,
     end_time: endTime,
@@ -194,7 +167,7 @@ export async function getPatternSamples(
   startTime: string,
   endTime: string
 ) {
-  return callTool("get_pattern_samples", {
+  return executeTool("get_pattern_samples", {
     file_id: fileId,
     pattern_signature: patternSignature,
     start_time: startTime,
@@ -211,15 +184,15 @@ export async function getPatternSamples(
  * Use this to identify false positives and update IGNORE_PATTERNS
  */
 export async function debugSemanticMatches(fileId: number) {
-  return callTool("debug_semantic_matches", { file_id: fileId });
+  return executeTool("debug_semantic_matches", { file_id: fileId });
 }
 
 // ============================================================
 // NON-DUCKDB APIS
 // ============================================================
 
-export async function listSessionFiles(sessionId: string) {
-  const response = await fetch(`${BASE_URL}/api/sessions/${sessionId}/files`);
-  if (!response.ok) return [];
-  return response.json();
-}
+// export async function listSessionFiles(sessionId: string) {
+//   const response = await fetch(`${BASE_URL}/api/sessions/${sessionId}/files`);
+//   if (!response.ok) return [];
+//   return response.json();
+// }

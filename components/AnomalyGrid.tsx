@@ -206,7 +206,7 @@ export function AnomalyGrid({
               return (
                 <div className="bg-slate-900 text-white text-xs rounded-lg p-3 shadow-xl min-w-[200px]">
                   <p className="font-bold mb-2">
-                    {new Date(label).toLocaleString()}
+                    {label ? new Date(label).toLocaleString() : "Unknown time"}
                   </p>
 
                   {/* Log counts by severity */}

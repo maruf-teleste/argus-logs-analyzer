@@ -1,27 +1,23 @@
 import { NextResponse } from "next/server";
-import { sql } from "@/lib/db/client";
+import { db } from "@/lib/db";
+
+export const dynamic = "force-dynamic";
 
 export async function GET(
   _req: Request,
-  context: { params: { sessionId: string } }
+  context: { params: Promise<{ sessionId: string }> }
 ) {
   try {
     const { sessionId } = await context.params;
 
-    const rows = await sql`
-      SELECT id, role, content, metadata, created_at
-      FROM conversation_history
-      WHERE session_id = ${sessionId}
-      ORDER BY created_at ASC
-      LIMIT 50
-    `;
+    const rows = db.getConversation(sessionId, 50);
 
-    const messages = rows.map((row: any) => ({
+    const messages = rows.map((row) => ({
       id: row.id?.toString() ?? crypto.randomUUID(),
       role: row.role,
       content: row.content,
       timestamp: new Date(row.created_at).toISOString(),
-      metadata: row.metadata ?? undefined,
+      metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
     }));
 
     return NextResponse.json({ messages });

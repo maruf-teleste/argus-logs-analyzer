@@ -40,6 +40,13 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/static ./.next/static
 
+# Copy KB files (not included in standalone trace)
+COPY --from=builder /app/data/kb ./data/kb
+
+# Create writable directories for runtime data
+RUN mkdir -p ./data/parquet/logs
+
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+# Increase Node.js heap to 6GB for processing large files (1GB+ with multiple concurrent uploads)
+CMD ["node", "--max-old-space-size=6144", "server.js"]

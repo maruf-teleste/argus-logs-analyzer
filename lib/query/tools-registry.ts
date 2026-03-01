@@ -127,6 +127,12 @@ export const TOOLS: Record<string, ToolDefinition> = {
   },
 
   // Device Analysis
+  get_failing_devices: {
+    name: "get_failing_devices",
+    implementation: client.getFailingDevices,
+    paramMapper: (p) => [p.file_id],
+  },
+
   get_device_summary: {
     name: "get_device_summary",
     implementation: client.getDeviceSummary,

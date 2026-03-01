@@ -21,6 +21,7 @@ interface FileUploadProps {
   sessionId: string;
   onUploadComplete?: (fileId: string, eventsCount: number) => void;
   onUploadError?: (error: string) => void;
+  onUploadStart?: () => void;
   maxFiles?: number;
   maxSizeMB?: number;
   acceptedFileTypes?: string[];
@@ -31,6 +32,7 @@ export function FileUpload({
   sessionId,
   onUploadComplete,
   onUploadError,
+  onUploadStart,
   maxFiles = 10,
   acceptedFileTypes = [".log", ".txt"],
   className,
@@ -38,7 +40,80 @@ export function FileUpload({
   const [uploads, setUploads] = useState<UploadProgress[]>([]);
   const [isDragActive, setIsDragActive] = useState(false);
 
-  const uploadFile = (file: File) => {
+  // Poll for completion when stream disconnects
+  const pollForCompletion = async (fileId: string, s3Key: string, fileName: string) => {
+    console.log("Polling for completion...");
+    setUploads((prev) =>
+      prev.map((u) =>
+        u.fileId === fileId
+          ? { ...u, stage: "processing", progress: 85 }
+          : u
+      )
+    );
+
+    const maxAttempts = 60; // Poll for up to 10 minutes (60 * 10s)
+    let attempts = 0;
+
+    const poll = async (): Promise<void> => {
+      try {
+        const response = await fetch(
+          `/api/sessions/${sessionId}/upload-status?s3Key=${encodeURIComponent(s3Key)}`
+        );
+        const data = await response.json();
+
+        if (data.status === "complete") {
+          console.log("✅ Upload completed in background!");
+          setUploads((prev) =>
+            prev.map((u) =>
+              u.fileId === fileId
+                ? { ...u, stage: "complete", progress: 100 }
+                : u
+            )
+          );
+
+          onUploadComplete?.(data.fileId, data.stats?.totalLines || 0);
+
+          setTimeout(() => {
+            setUploads((prev) => prev.filter((u) => u.fileId !== fileId));
+          }, 3000);
+        } else if (attempts < maxAttempts) {
+          // Still processing, poll again
+          attempts++;
+          setUploads((prev) =>
+            prev.map((u) =>
+              u.fileId === fileId
+                ? { ...u, progress: Math.min(95, 85 + attempts) }
+                : u
+            )
+          );
+          setTimeout(poll, 10000); // Poll every 10 seconds
+        } else {
+          // Timeout
+          setUploads((prev) =>
+            prev.map((u) =>
+              u.fileId === fileId
+                ? {
+                    ...u,
+                    stage: "error",
+                    error: "Processing timeout - check server logs",
+                  }
+                : u
+            )
+          );
+        }
+      } catch (err) {
+        console.error("Polling error:", err);
+        if (attempts < maxAttempts) {
+          attempts++;
+          setTimeout(poll, 10000);
+        }
+      }
+    };
+
+    poll();
+  };
+
+  const uploadFile = async (file: File) => {
     const fileId = `${Date.now()}-${file.name}`;
 
     // Add to upload list
@@ -52,109 +127,241 @@ export function FileUpload({
       },
     ]);
 
-    const formData = new FormData();
-    formData.append("file", file);
-
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", `/api/sessions/${sessionId}/upload`);
-    xhr.responseType = "text";
-
-    /* ===============================
-     REAL UPLOAD PROGRESS (0–40%)
-     =============================== */
-    xhr.upload.onprogress = (e) => {
-      if (!e.lengthComputable) return;
-
-      const progress = Math.round((e.loaded / e.total) * 40);
+    try {
+      /* Step 0: Compress file with gzip in browser */
       setUploads((prev) =>
         prev.map((u) =>
-          u.fileId === fileId ? { ...u, progress, stage: "uploading" } : u
+          u.fileId === fileId ? { ...u, progress: 0, stage: "compressing" } : u
         )
       );
-    };
 
-    /* ===============================
-     REAL SERVER PROGRESS (SSE)
-     =============================== */
-    let lastIndex = 0;
+      let uploadBlob: Blob = file;
+      let isGzipped = false;
 
-    xhr.onprogress = () => {
-      const chunk = xhr.responseText.slice(lastIndex);
-      lastIndex = xhr.responseText.length;
-
-      const lines = chunk.split("\n");
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-
+      if (typeof CompressionStream !== "undefined") {
         try {
-          const msg = JSON.parse(line.slice(6));
-          const safeProgress = Math.max(
-            0,
-            Math.min(100, Number(msg.progress) || 0)
+          const cs = new CompressionStream("gzip");
+          const compressedStream = file.stream().pipeThrough(cs);
+          uploadBlob = await new Response(compressedStream).blob();
+          isGzipped = true;
+          const ratio = ((1 - uploadBlob.size / file.size) * 100).toFixed(0);
+          console.log(
+            `Compressed ${file.name}: ${(file.size / 1024 / 1024).toFixed(1)}MB → ${(uploadBlob.size / 1024 / 1024).toFixed(1)}MB (${ratio}% smaller)`
           );
+        } catch (err) {
+          console.warn("Gzip compression failed, uploading uncompressed:", err);
+        }
+      }
 
-          setUploads((prev) =>
-            prev.map((u) =>
-              u.fileId === fileId
-                ? {
-                    ...u,
-                    progress: Math.max(u.progress, safeProgress),
-                    stage: msg.stage,
-                  }
-                : u
-            )
-          );
+      /* Step 1: Get pre-signed S3 URL */
+      setUploads((prev) =>
+        prev.map((u) =>
+          u.fileId === fileId ? { ...u, progress: 0, stage: "preparing" } : u
+        )
+      );
 
-          if (msg.stage === "complete") {
-            onUploadComplete?.(
-              msg.payload.fileId,
-              msg.payload.stats.totalLines
-            );
+      const urlResponse = await fetch(`/api/sessions/${sessionId}/upload-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: file.name,
+          fileSize: uploadBlob.size,
+          isGzipped,
+        }),
+      });
 
-            setTimeout(() => {
-              setUploads((prev) => prev.filter((u) => u.fileId !== fileId));
-            }, 3000);
+      if (!urlResponse.ok) throw new Error("Failed to get upload URL");
+
+      const { uploadUrl, s3Key } = await urlResponse.json();
+      console.log("Got S3 upload URL, key:", s3Key);
+
+      /* Step 2: Upload directly to S3 (0-40%) */
+      const s3xhr = new XMLHttpRequest();
+      s3xhr.open("PUT", uploadUrl);
+      s3xhr.timeout = 0;
+
+      // Set content type based on compression
+      s3xhr.setRequestHeader(
+        "Content-Type",
+        isGzipped ? "application/gzip" : "text/plain"
+      );
+
+      s3xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const progress = Math.round((e.loaded / e.total) * 40);
+        setUploads((prev) =>
+          prev.map((u) =>
+            u.fileId === fileId ? { ...u, progress, stage: "uploading" } : u
+          )
+        );
+      };
+
+      await new Promise((resolve, reject) => {
+        s3xhr.onload = () => {
+          console.log("S3 upload response:", s3xhr.status, s3xhr.statusText);
+          if (s3xhr.status === 200) {
+            console.log("S3 upload successful for:", file.name);
+            resolve(null);
           }
+          else reject(new Error(`S3 upload failed: ${s3xhr.status} ${s3xhr.statusText}`));
+        };
+        s3xhr.onerror = (e) => {
+          console.error("S3 upload error event:", e);
+          reject(new Error("S3 upload network error - check CORS and bucket permissions"));
+        };
+        console.log("Starting S3 upload for file:", file.name, "size:", uploadBlob.size, isGzipped ? "(gzipped)" : "");
+        s3xhr.send(uploadBlob);
+      });
 
-          if (msg.stage === "error") {
-            const errorMessage =
-              typeof msg.payload === "string"
-                ? msg.payload
-                : msg.payload?.error || "Upload failed";
+      console.log("S3 upload complete, notifying server to process...");
+      onUploadStart?.();
+
+      /* Step 3: Notify server to process (40-100%) */
+      setUploads((prev) =>
+        prev.map((u) =>
+          u.fileId === fileId ? { ...u, progress: 40, stage: "processing" } : u
+        )
+      );
+
+      const processXhr = new XMLHttpRequest();
+      processXhr.open("POST", `/api/sessions/${sessionId}/process`);
+      processXhr.setRequestHeader("Content-Type", "application/json");
+      processXhr.responseType = "text";
+      processXhr.timeout = 0;
+
+      console.log("Sending process request with:", { s3Key, fileName: file.name });
+
+      /* Server-side progress via SSE (40-100%) */
+      let lastIndex = 0;
+
+      let receivedComplete = false;
+
+      // Process SSE lines from a chunk of text.
+      // Extracted so both onprogress and onload can use it.
+      const processSSELines = (text: string) => {
+        const lines = text.split("\n");
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const msg = JSON.parse(line.slice(6));
+
+            // Skip keepalive pings from server
+            if (msg.payload?.ping) continue;
+
+            const safeProgress = Math.max(
+              0,
+              Math.min(100, Number(msg.progress) || 0)
+            );
 
             setUploads((prev) =>
               prev.map((u) =>
                 u.fileId === fileId
                   ? {
                       ...u,
-                      stage: "error",
-                      error: errorMessage,
+                      progress: Math.max(u.progress, safeProgress),
+                      stage: msg.stage,
                     }
                   : u
               )
             );
 
-            onUploadError?.(errorMessage);
-          }
-        } catch {
-          // Ignore malformed partial chunks
-        }
-      }
-    };
+            if (msg.stage === "complete") {
+              receivedComplete = true;
+              console.log("[FileUpload] SSE complete received, calling onUploadComplete");
+              try {
+                onUploadComplete?.(
+                  msg.payload?.fileId ?? fileId,
+                  msg.payload?.stats?.totalLines ?? 0
+                );
+              } catch (err) {
+                console.error("[FileUpload] onUploadComplete callback error:", err);
+              }
 
-    xhr.onerror = () => {
+              setTimeout(() => {
+                setUploads((prev) => prev.filter((u) => u.fileId !== fileId));
+              }, 3000);
+            }
+
+            if (msg.stage === "error") {
+              receivedComplete = true; // Don't poll after error
+              const errorMessage =
+                typeof msg.payload === "string"
+                  ? msg.payload
+                  : msg.payload?.error || "Processing failed";
+
+              setUploads((prev) =>
+                prev.map((u) =>
+                  u.fileId === fileId
+                    ? {
+                        ...u,
+                        stage: "error",
+                        error: errorMessage,
+                      }
+                    : u
+                )
+              );
+
+              onUploadError?.(errorMessage);
+            }
+          } catch {
+            // Ignore malformed partial chunks
+          }
+        }
+      };
+
+      processXhr.onprogress = () => {
+          const text = processXhr.responseText;
+          const chunk = text.slice(lastIndex);
+
+          // Only process up to the last complete message boundary (\n\n)
+          // to avoid losing messages split across TCP segments by ALB
+          const lastBoundary = chunk.lastIndexOf("\n\n");
+          if (lastBoundary === -1) return; // No complete messages yet
+
+          const complete = chunk.slice(0, lastBoundary + 2);
+          lastIndex += lastBoundary + 2;
+
+          processSSELines(complete);
+      };
+
+      // When the XHR finishes (onload/onerror/onabort), process any
+      // remaining data that onprogress may have missed (e.g. the final
+      // "complete" event arrived but onprogress didn't fire for it).
+      const handleStreamEnd = (reason: string) => {
+        if (!receivedComplete) {
+          const remaining = processXhr.responseText.slice(lastIndex);
+          if (remaining.length > 0) {
+            processSSELines(remaining);
+          }
+        }
+        if (!receivedComplete) {
+          console.log(`SSE stream ended (${reason}), polling for status...`);
+          pollForCompletion(fileId, s3Key, file.name);
+        }
+      };
+
+      processXhr.onload = () => handleStreamEnd("closed");
+      processXhr.onerror = () => handleStreamEnd("error");
+      processXhr.onabort = () => handleStreamEnd("aborted");
+
+      processXhr.send(JSON.stringify({ s3Key, fileName: file.name, isGzipped }));
+    } catch (error) {
+      console.error("Upload error:", error);
       setUploads((prev) =>
         prev.map((u) =>
           u.fileId === fileId
-            ? { ...u, stage: "error", error: "Network error" }
+            ? {
+                ...u,
+                stage: "error",
+                error: error instanceof Error ? error.message : "Upload failed",
+              }
             : u
         )
       );
-      onUploadError?.("Network error");
-    };
-
-    xhr.send(formData);
+      onUploadError?.(
+        error instanceof Error ? error.message : "Upload failed"
+      );
+    }
   };
 
   const onDrop = useCallback(
@@ -206,10 +413,18 @@ export function FileUpload({
 
   const getStageText = (stage: string) => {
     switch (stage) {
+      case "compressing":
+        return "Compressing file...";
+      case "preparing":
+        return "Preparing upload...";
       case "starting":
         return "Starting...";
       case "uploading":
-        return "Uploading...";
+        return "Uploading to S3...";
+      case "processing":
+        return "Processing...";
+      case "downloading":
+        return "Server downloading from S3...";
       case "hashing":
         return "Calculating hash...";
       case "parsing":
@@ -217,9 +432,11 @@ export function FileUpload({
       case "writing_parquet":
         return "Writing Parquet...";
       case "uploading_to_s3":
-        return "Uploading to S3...";
+        return "Saving Parquet to S3...";
       case "saving_metadata":
         return "Saving metadata...";
+      case "findings":
+        return "Analyzing patterns...";
       case "complete":
         return "Complete";
       case "error":
@@ -290,8 +507,17 @@ export function FileUpload({
                   {upload.stage === "error" && (
                     <AlertCircle className="w-5 h-5 text-red-400" />
                   )}
-                  {(upload.stage === "uploading" ||
+                  {(upload.stage === "compressing" ||
+                    upload.stage === "preparing" ||
+                    upload.stage === "starting" ||
+                    upload.stage === "uploading" ||
+                    upload.stage === "processing" ||
+                    upload.stage === "downloading" ||
                     upload.stage === "parsing" ||
+                    upload.stage === "writing_parquet" ||
+                    upload.stage === "uploading_to_s3" ||
+                    upload.stage === "saving_metadata" ||
+                    upload.stage === "findings" ||
                     upload.stage === "inserting") && (
                     <Loader2 className="w-5 h-5 text-primary spinner" />
                   )}

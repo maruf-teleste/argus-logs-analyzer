@@ -6,54 +6,74 @@ import { useState, useRef, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Send,
   Loader2,
-  Bot,
   User,
   AlertCircle,
   CheckCircle2,
   Clock,
   Search,
   Sparkles,
-  FileSearch,
+  ChevronDown,
+  ChevronRight,
+  Brain,
+  Database,
+  BookOpen,
+  Wrench,
+  Zap,
+  Copy,
+  Check,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { ChatMessage, QueryIntent } from "@/types/session";
+import type { ChatMessage } from "@/types/session";
 import { formatDistanceToNow } from "date-fns";
-import type { ProactiveInsight } from "@/lib/ai/proactive-insights";
+import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 interface ChatInterfaceProps {
   sessionId: string;
   className?: string;
-  proactiveSuggestions?: ProactiveInsight[];
-  clearSuggestions?: () => void;
+}
+
+interface ConversationRow {
+  id: string;
+  role: ChatMessage["role"];
+  content: string;
+  timestamp: string;
+  metadata?: ChatMessage["metadata"] | null;
+}
+
+interface SourceCounts {
+  tools: number;
+  sql: number;
+  docs: number;
 }
 
 export function ChatInterface({
   sessionId,
   className,
-  proactiveSuggestions = [],
-  clearSuggestions = () => {},
 }: ChatInterfaceProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [agentStage, setAgentStage] = useState<{
+    stage: string;
+    message: string;
+    workers?: string[];
+  } | null>(null);
+  const [agentActivities, setAgentActivities] = useState<
+    Array<{
+      id: string;
+      kind: "tool" | "sql" | "kb";
+      name: string;
+      detail?: string;
+    }>
+  >([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [isSuggestionsLoading, setIsSuggestionsLoading] = useState(true); // New state
-
-  useEffect(() => {
-    if (proactiveSuggestions && proactiveSuggestions.length > 0) {
-      setIsSuggestionsLoading(false);
-    } else if (proactiveSuggestions && proactiveSuggestions.length === 0) {
-      setIsSuggestionsLoading(false); // No suggestions, but done loading
-    } else {
-      setIsSuggestionsLoading(true); // Still loading or no data yet
-    }
-  }, [proactiveSuggestions]);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,13 +86,13 @@ export function ChatInterface({
         if (cancelled) return;
 
         setMessages(
-          (rows as any[]).map((row) => ({
+          (rows as ConversationRow[]).map((row) => ({
             id: row.id,
             role: row.role,
             content: row.content,
             timestamp: new Date(row.timestamp),
             metadata: row.metadata ?? {},
-          }))
+          })),
         );
       } catch (err) {
         console.error("History load failed:", err);
@@ -147,8 +167,6 @@ export function ChatInterface({
     const message = messageContent || input;
     if (!message.trim() || isLoading) return;
 
-    clearSuggestions();
-
     const userMessage: ChatMessage = {
       id: Date.now().toString(),
       role: "user",
@@ -159,6 +177,8 @@ export function ChatInterface({
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setIsLoading(true);
+    setAgentStage(null);
+    setAgentActivities([]);
 
     try {
       const response = await fetch(`/api/sessions/${sessionId}/query`, {
@@ -169,23 +189,90 @@ export function ChatInterface({
 
       if (!response.ok) throw new Error("Query failed");
 
-      const data = await response.json();
+      // Read SSE stream
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalAnswer = "";
+      let finalMetadata: Partial<NonNullable<ChatMessage["metadata"]>> = {};
+
+      if (!reader) throw new Error("No response body");
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+
+            if (event.stage === "complete") {
+              finalAnswer = event.answer || "";
+              finalMetadata = event.metadata || {};
+            } else if (event.stage === "error") {
+              finalAnswer = event.answer || "An error occurred.";
+            } else {
+              // Progress event
+              setAgentStage({
+                stage: event.stage,
+                message: event.message,
+                workers: event.workers,
+              });
+
+              if (event.activity?.name) {
+                setAgentActivities((prev) => {
+                  const id = `${event.activity.kind || "tool"}:${event.activity.name}:${event.activity.detail || ""}`;
+                  if (prev.some((a) => a.id === id)) return prev;
+
+                  const next = [
+                    ...prev,
+                    {
+                      id,
+                      kind: (event.activity.kind || "tool") as
+                        | "tool"
+                        | "sql"
+                        | "kb",
+                      name: String(event.activity.name),
+                      detail: event.activity.detail
+                        ? String(event.activity.detail)
+                        : undefined,
+                    },
+                  ];
+                  return next.slice(-6);
+                });
+              }
+            }
+          } catch {
+            // Skip malformed SSE lines
+          }
+        }
+      }
 
       const assistantMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
-        content: data.answer,
+        content: finalAnswer || "I couldn't generate a response.",
         timestamp: new Date(),
         metadata: {
-          intent: data.intent,
-          entities: data.entities,
-          resultCount: data.events?.length || 0,
-          processingTime: data.metadata?.processingTime,
+          processingTime: finalMetadata.processingTime,
+          reasoning: finalMetadata.reasoning,
+          toolsUsed: finalMetadata.toolsUsed,
+          sqlQueries: finalMetadata.sqlQueries,
+          kbKeywords: finalMetadata.kbKeywords,
+          workerCount: finalMetadata.workerCount,
+          successCount: finalMetadata.successCount,
         },
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
-    } catch (error) {
+    } catch {
       const errorMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
@@ -200,6 +287,7 @@ export function ChatInterface({
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
+      setAgentStage(null);
       textareaRef.current?.focus();
     }
   };
@@ -211,55 +299,23 @@ export function ChatInterface({
     }
   };
 
-  const getIntentBadge = (intent?: QueryIntent) => {
-    if (!intent || intent === "UNKNOWN") return null;
-
-    const intentConfig = {
-      ROOT_CAUSE: {
-        label: "Root Cause",
-        className: "bg-red-500/10 text-red-400 border-red-500/30",
-      },
-      DEVICE_OVERVIEW: {
-        label: "Device Overview",
-        className: "bg-blue-500/10 text-blue-400 border-blue-500/30",
-      },
-      ERROR_SEARCH: {
-        label: "Error Search",
-        className: "bg-yellow-500/10 text-yellow-400 border-yellow-500/30",
-      },
-      TIMELINE: {
-        label: "Timeline",
-        className: "bg-purple-500/10 text-purple-400 border-purple-500/30",
-      },
-      ANALYSIS: {
-        label: "Analysis",
-        className: "bg-green-500/10 text-green-400 border-green-500/30",
-      },
-    };
-
-    const config = intentConfig[intent];
-    if (!config) return null;
-
-    return (
-      <Badge variant="outline" className={cn("text-xs", config.className)}>
-        {config.label}
-      </Badge>
-    );
-  };
+  const liveSourceCounts = getLiveSourceCountsFromWorkers(agentStage?.workers);
 
   return (
-    <Card className={cn("flex flex-col h-full overflow-hidden", className)}>
-      <CardHeader className="pb-4 border-b bg-gradient-to-br from-background to-muted/20">
-        <CardTitle className="flex items-center gap-2.5 text-lg">
-          <div className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center ring-2 ring-primary/20">
-            <Bot className="w-5 h-5 text-primary" />
+    <Card
+      className={cn(
+        "flex h-full flex-col overflow-hidden rounded-none border-0 bg-background shadow-none",
+        className,
+      )}
+    >
+      <CardHeader className="border-b border-border/50 px-6 pb-3 pt-4">
+        <CardTitle className="flex items-center gap-2.5 text-base">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-100 to-orange-100 flex items-center justify-center">
+            <Sparkles className="w-4 h-4 text-amber-600" />
           </div>
           <div className="flex-1">
-            <div className="flex items-center gap-2">
-              <span>AI Log Analyzer</span>
-              <Sparkles className="w-4 h-4 text-yellow-500 animate-pulse" />
-            </div>
-            <p className="text-xs text-muted-foreground font-normal mt-0.5">
+            <span className="font-semibold text-foreground">Log Analyzer</span>
+            <p className="text-[11px] text-muted-foreground font-normal mt-0.5">
               Ask questions about your logs in natural language
             </p>
           </div>
@@ -268,36 +324,78 @@ export function ChatInterface({
 
       <CardContent className="flex-1 flex flex-col p-0 overflow-hidden min-h-0">
         {/* Messages Area */}
-        <ScrollArea className="flex-1 px-4 py-6">
-          <div className="space-y-6 max-w-4xl mx-auto">
+        <ScrollArea className="flex-1 bg-gradient-to-b from-background via-background to-muted/10 px-4 py-8">
+          <div className="mx-auto w-full max-w-3xl space-y-8">
             {messages.length === 0 ? (
-              <EmptyState
-                setInput={setInput}
-              />
+              <EmptyState setInput={setInput} />
             ) : (
-              messages.map((message, index) => (
-                <MessageBubble
-                  key={message.id}
-                  message={message}
-                  getIntentBadge={getIntentBadge}
-                  isLatest={index === messages.length - 1}
-                />
+              messages.map((message) => (
+                <MessageBubble key={message.id} message={message} />
               ))
             )}
 
-            {/* Loading indicator */}
+            {/* Loading indicator with real-time agent activity */}
             {isLoading && (
-              <div className="flex items-start gap-3 animate-in fade-in slide-in-from-bottom-4 duration-300">
-                <div className="flex-shrink-0 w-9 h-9 rounded-full bg-gradient-to-br from-primary/20 to-primary/10 flex items-center justify-center ring-2 ring-primary/10">
-                  <Bot className="w-5 h-5 text-primary" />
-                </div>
-                <div className="flex-1 mt-1">
-                  <div className="bg-muted/50 backdrop-blur-sm rounded-2xl rounded-tl-sm p-4 inline-block shadow-sm">
-                    <div className="flex items-center gap-2">
-                      <Loader2 className="w-4 h-4 text-primary animate-spin" />
-                      <span className="text-sm text-muted-foreground">
-                        Analyzing...
-                      </span>
+              <div className="max-w-[92%] animate-in fade-in slide-in-from-bottom-4 duration-300 rounded-2xl border border-border/50 bg-card/80 px-3.5 py-3 backdrop-blur-sm">
+                <div className="flex items-start gap-3">
+                  <div className="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center bg-gradient-to-br from-amber-100 to-orange-100 mt-0.5">
+                    <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    {/* Activity feed */}
+                    <div className="space-y-1.5">
+                      {/* Stage indicator */}
+                      <div className="flex items-center gap-2">
+                        <Loader2 className="w-3.5 h-3.5 text-primary animate-spin" />
+                        <span className="text-sm font-medium text-foreground">
+                          {!agentStage || agentStage.stage === "planning"
+                            ? "Thinking..."
+                            : agentStage.stage === "synthesizing"
+                              ? "Writing response..."
+                            : "Analyzing your logs..."}
+                        </span>
+                      </div>
+                      <p className="pl-5.5 text-[11px] text-muted-foreground/70">
+                        {formatSourceSummary(liveSourceCounts)}
+                      </p>
+
+                      {/* Real-time plan reasoning */}
+                      {agentStage?.message &&
+                        agentStage.stage === "planning" &&
+                        agentStage.message !== "Planning analysis approach..." && (
+                          <p className="text-xs text-muted-foreground pl-5.5 leading-relaxed animate-in fade-in duration-300">
+                            {agentStage.message}
+                          </p>
+                        )}
+
+                      {/* Live activity items */}
+                      {agentActivities.length > 0 && (
+                        <div className="pl-5.5 space-y-1 pt-0.5">
+                          {agentActivities.map((activity, idx) => (
+                            <div
+                              key={activity.id}
+                              className={cn(
+                                "flex items-center gap-2 text-xs animate-in fade-in slide-in-from-left-2 duration-200",
+                                idx === agentActivities.length - 1
+                                  ? "text-foreground/70"
+                                  : "text-muted-foreground/50",
+                              )}
+                            >
+                              {idx === agentActivities.length - 1 ? (
+                                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                              ) : (
+                                <CheckCircle2 className="w-3 h-3 text-emerald-500" />
+                              )}
+                              <span>{activity.name}</span>
+                              {activity.detail && (
+                                <span className="text-muted-foreground/40 truncate max-w-[200px]">
+                                  - {activity.detail}
+                                </span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -309,43 +407,27 @@ export function ChatInterface({
         </ScrollArea>
 
         {/* Input Area */}
-        <div className="p-4 border-t bg-gradient-to-br from-background to-muted/10 backdrop-blur-sm">
-          <div className="max-w-4xl mx-auto space-y-3">
-            {/* Proactive Suggestions Area */}
-            {isSuggestionsLoading ? (
-              <div className="w-full max-w-lg mb-4 text-center">
-                <p className="text-xs text-muted-foreground font-semibold uppercase tracking-wide flex items-center justify-center gap-2">
-                  <Loader2 className="w-3 h-3 animate-spin" />
-                  Analyzing for suggestions...
-                </p>
-              </div>
-            ) : proactiveSuggestions.length > 0 && (
-              <SuggestionChips
-                suggestions={proactiveSuggestions}
-                onSuggestionClick={(query) => {
-                  setInput(query);
-                  sendMessage(query);
-                }}
-              />
-            )}
-
+        <div className="border-t border-border/50 bg-background/95 px-4 py-4 backdrop-blur supports-[backdrop-filter]:bg-background/85">
+          <div className="mx-auto w-full max-w-3xl space-y-3">
             <div className="flex gap-3 items-end">
               <div className="flex-1 relative">
                 <Textarea
                   ref={textareaRef}
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
+                  onChange={(e) => {
+                    setInput(e.target.value);
+                  }}
                   onKeyDown={handleKeyDown}
                   placeholder="Ask about errors, devices, or timelines..."
-                  className="resize-y min-h-[56px] max-h-[500px] rounded-xl border-border/50 focus-visible:ring-2 focus-visible:ring-primary/20 shadow-sm"
+                  className="resize-y min-h-[52px] max-h-[500px] rounded-2xl border-border/70 bg-card/95 px-4 py-3 text-[14px] shadow-sm focus-visible:ring-2 focus-visible:ring-primary/20"
                   rows={input.length > 200 ? 8 : 1}
                 />
               </div>
               <Button
-                onClick={sendMessage}
+                onClick={() => sendMessage()}
                 disabled={!input.trim() || isLoading}
                 size="lg"
-                className="h-[56px] w-[56px] rounded-xl shadow-md hover:shadow-lg transition-all duration-200 disabled:opacity-50 flex-shrink-0"
+                className="h-[56px] w-[56px] shrink-0 rounded-2xl shadow-md transition-all duration-200 hover:shadow-lg disabled:opacity-50"
               >
                 {isLoading ? (
                   <Loader2 className="w-5 h-5 animate-spin" />
@@ -355,27 +437,6 @@ export function ChatInterface({
               </Button>
             </div>
 
-            {/* Quick Actions */}
-            <div className="flex flex-wrap gap-2">
-              <QuickActionButton
-                onClick={() => setInput("Show me all errors")}
-                icon={<AlertCircle className="w-3.5 h-3.5" />}
-              >
-                Show Errors
-              </QuickActionButton>
-              <QuickActionButton
-                onClick={() => setInput("Give me an overview")}
-                icon={<Search className="w-3.5 h-3.5" />}
-              >
-                Overview
-              </QuickActionButton>
-              <QuickActionButton
-                onClick={() => setInput("What happened in the last hour?")}
-                icon={<Clock className="w-3.5 h-3.5" />}
-              >
-                Recent Activity
-              </QuickActionButton>
-            </div>
           </div>
         </div>
       </CardContent>
@@ -386,83 +447,293 @@ export function ChatInterface({
 // Message Bubble Component
 interface MessageBubbleProps {
   message: ChatMessage;
-  getIntentBadge: (intent?: QueryIntent) => React.ReactNode;
-  isLatest?: boolean;
 }
 
-function MessageBubble({
-  message,
-  getIntentBadge,
-  isLatest,
-}: MessageBubbleProps) {
+function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === "user";
 
-  return (
-    <div
-      className={cn(
-        "flex items-start gap-3 animate-in fade-in slide-in-from-bottom-2 duration-300",
-        isUser && "flex-row-reverse"
-      )}
-    >
-      {/* Avatar */}
-      <div
-        className={cn(
-          "flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center ring-2 shadow-sm",
-          isUser
-            ? "bg-gradient-to-br from-primary to-primary/80 ring-primary/20"
-            : "bg-gradient-to-br from-muted to-muted/50 ring-border/50"
-        )}
-      >
-        {isUser ? (
-          <User className="w-5 h-5 text-primary-foreground" />
-        ) : (
-          <Bot className="w-5 h-5 text-foreground" />
-        )}
-      </div>
-
-      {/* Message Content */}
-      <div
-        className={cn(
-          "flex-1 space-y-2 min-w-0",
-          isUser && "flex flex-col items-end"
-        )}
-      >
-        <div
-          className={cn(
-            "rounded-2xl p-4 max-w-[85%] inline-block shadow-sm backdrop-blur-sm",
-            isUser
-              ? "bg-primary text-primary-foreground rounded-tr-sm"
-              : "bg-muted/50 rounded-tl-sm border border-border/50"
-          )}
-        >
-          <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
-            {message.content}
-          </p>
+  if (isUser) {
+    return (
+      <div className="flex items-start gap-3 flex-row-reverse animate-in fade-in slide-in-from-bottom-2 duration-300">
+        <div className="h-7 w-7 shrink-0 rounded-full bg-primary mt-0.5 flex items-center justify-center">
+          <User className="w-3.5 h-3.5 text-primary-foreground" />
         </div>
-
-        {/* Metadata */}
-        <div
-          className={cn(
-            "flex items-center gap-2 text-xs text-muted-foreground px-2",
-            isUser && "flex-row-reverse"
-          )}
-        >
-          <span className="font-medium">
+        <div className="flex-1 flex flex-col items-end space-y-1 min-w-0">
+          <div className="max-w-[85%] rounded-2xl rounded-tr-md bg-primary px-4 py-2.5 text-primary-foreground shadow-sm">
+            <p className="text-[13.5px] leading-relaxed whitespace-pre-wrap break-words">
+              {message.content}
+            </p>
+          </div>
+          <span className="text-[11px] text-muted-foreground/50 px-1">
             {formatDistanceToNow(message.timestamp, { addSuffix: true })}
           </span>
+        </div>
+      </div>
+    );
+  }
 
-          {message.metadata?.intent && getIntentBadge(message.metadata.intent)}
+  // Assistant message - rich card
+  return <AssistantCard message={message} />;
+}
 
-          {message.metadata?.resultCount !== undefined && (
-            <Badge variant="outline" className="text-xs gap-1 bg-background/50">
-              <CheckCircle2 className="w-3 h-3" />
-              {message.metadata.resultCount}
-            </Badge>
+const markdownComponents: Components = {
+  pre({ children }) {
+    return <>{children}</>;
+  },
+  code({ className, children }) {
+    const code = String(children ?? "").replace(/\n$/, "");
+    const hasLanguage = Boolean(className?.includes("language-"));
+    const hasLineBreak = /\r?\n/.test(code);
+    const isLongSingleLine = code.length > 120;
+
+    if (hasLanguage || hasLineBreak || isLongSingleLine) {
+      const language = className?.replace("language-", "").trim() || "text";
+      return <MarkdownCodeBlock code={code} language={language} />;
+    }
+    return (
+      <code className="rounded bg-muted/70 px-1.5 py-0.5 text-[12.5px] text-foreground">
+        {code}
+      </code>
+    );
+  },
+  table({ children }) {
+    return (
+      <div className="my-4 overflow-x-auto rounded-lg border border-border/40">
+        <table className="w-full">{children}</table>
+      </div>
+    );
+  },
+  a({ href, children }) {
+    const isExternal = href?.startsWith("http");
+    return (
+      <a
+        href={href}
+        target={isExternal ? "_blank" : undefined}
+        rel={isExternal ? "noopener noreferrer" : undefined}
+      >
+        {children}
+      </a>
+    );
+  },
+};
+
+function normalizeAssistantMarkdown(content: string): string {
+  return content.replace(
+    /```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)\r?\n```/g,
+    (block, _language, body) => {
+      const trimmed = String(body ?? "").replace(/\r/g, "").trim();
+      if (!trimmed) return block;
+      if (/\r?\n/.test(trimmed)) return block;
+      if (trimmed.length > 48) return block;
+      if (trimmed.includes("`")) return block;
+      if (!/[a-zA-Z0-9]/.test(trimmed)) return block;
+      return `\`${trimmed}\``;
+    },
+  );
+}
+
+function MarkdownCodeBlock({
+  code,
+  language,
+}: {
+  code: string;
+  language: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const label = (language || "text").toLowerCase();
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <div className="my-4 overflow-hidden rounded-xl border border-slate-700/40 bg-slate-950 shadow-sm">
+      <div className="flex items-center justify-between border-b border-slate-700/40 bg-slate-900/80 px-3 py-1.5">
+        <span className="text-[10px] uppercase tracking-wide text-slate-300">
+          {label}
+        </span>
+        <button
+          onClick={handleCopy}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-slate-300 transition-colors hover:bg-slate-800 hover:text-slate-100"
+          title="Copy code"
+        >
+          {copied ? (
+            <>
+              <Check className="h-3 w-3 text-emerald-400" />
+              Copied
+            </>
+          ) : (
+            <>
+              <Copy className="h-3 w-3" />
+              Copy
+            </>
           )}
+        </button>
+      </div>
+      <pre className="overflow-x-auto px-4 py-3 text-[12.5px] leading-relaxed text-slate-100">
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
+}
 
-          {message.metadata?.processingTime && (
-            <span className="text-xs opacity-70">
-              {message.metadata.processingTime}ms
+// Rich assistant response card - Claude/ChatGPT style
+function AssistantCard({ message }: { message: ChatMessage }) {
+  const [thinkingOpen, setThinkingOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const meta = message.metadata;
+  const renderedContent = normalizeAssistantMarkdown(message.content);
+  const analysisTaskCount = meta?.workerCount || 0;
+  const completedTaskCount = meta?.successCount || 0;
+  const finalSourceCounts = getSourceCountsFromMetadata(meta);
+  const hasAgentMeta =
+    meta?.reasoning ||
+    (meta?.toolsUsed && meta.toolsUsed.length > 0) ||
+    (meta?.sqlQueries && meta.sqlQueries.length > 0);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(message.content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const formatTime = (ms?: number) => {
+    if (!ms) return null;
+    if (ms < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(1)}s`;
+  };
+
+  return (
+    <div className="flex items-start gap-3 animate-in fade-in slide-in-from-bottom-2 duration-300">
+      <div className="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center bg-gradient-to-br from-amber-100 to-orange-100 mt-0.5">
+        <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+      </div>
+
+      <div className="flex-1 min-w-0 space-y-1">
+        {/* Collapsible agent thinking */}
+        {hasAgentMeta && (
+          <button
+            onClick={() => setThinkingOpen(!thinkingOpen)}
+            className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground transition-colors mb-1"
+          >
+            {thinkingOpen ? (
+              <ChevronDown className="w-3 h-3" />
+            ) : (
+              <ChevronRight className="w-3 h-3" />
+            )}
+            <Brain className="w-3 h-3" />
+            <span>{formatSourceSummary(finalSourceCounts)}</span>
+            <span className="text-muted-foreground/50">
+              ({completedTaskCount}/{analysisTaskCount} tasks)
+            </span>
+            {meta?.processingTime && (
+              <span className="text-muted-foreground/50">
+                &middot; {formatTime(meta.processingTime)}
+              </span>
+            )}
+          </button>
+        )}
+
+        {thinkingOpen && hasAgentMeta && (
+          <div className="rounded-lg bg-muted/50 border border-border/50 px-3.5 py-3 mb-2 space-y-2.5 text-xs animate-in fade-in slide-in-from-top-1 duration-200">
+            {meta?.reasoning && (
+              <p className="text-muted-foreground leading-relaxed">
+                {meta.reasoning}
+              </p>
+            )}
+            <div className="flex flex-wrap gap-1.5">
+              {meta?.toolsUsed?.map((tool) => (
+                <span key={tool} className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 border border-blue-200/60">
+                  <Wrench className="w-2.5 h-2.5" />
+                  {friendlyToolLabel(tool)}
+                </span>
+              ))}
+              {meta?.sqlQueries?.map((q, i) => (
+                <span key={i} className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-200/60">
+                  <Database className="w-2.5 h-2.5" />
+                  {q}
+                </span>
+              ))}
+              {meta?.kbKeywords && meta.kbKeywords.length > 0 && (
+                <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-violet-50 text-violet-600 border border-violet-200/60">
+                  <BookOpen className="w-2.5 h-2.5" />
+                  Docs: {meta.kbKeywords.slice(0, 3).join(", ")}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Markdown response body */}
+        <div className="agent-response prose prose-slate prose-sm max-w-none
+          [&>*:first-child]:mt-0 [&>*:last-child]:mb-0
+
+          prose-headings:text-foreground prose-headings:font-semibold prose-headings:tracking-tight
+          prose-h1:text-lg prose-h1:mt-6 prose-h1:mb-3
+          prose-h2:text-[15px] prose-h2:mt-7 prose-h2:mb-3 prose-h2:pb-2 prose-h2:border-b prose-h2:border-border/40
+          prose-h3:text-[14px] prose-h3:mt-5 prose-h3:mb-2 prose-h3:text-foreground/90
+          prose-h4:text-xs prose-h4:mt-4 prose-h4:mb-1.5 prose-h4:font-semibold prose-h4:uppercase prose-h4:tracking-wider prose-h4:text-muted-foreground
+
+          prose-p:text-[13.5px] prose-p:text-foreground/80 prose-p:leading-[1.75] prose-p:my-3
+
+          prose-strong:text-foreground prose-strong:font-semibold
+          prose-em:text-foreground/60
+
+          prose-ul:my-3 prose-ul:pl-0 prose-ol:my-3 prose-ol:pl-0
+          prose-li:text-[13.5px] prose-li:text-foreground/80 prose-li:leading-[1.75] prose-li:my-1
+          prose-li:marker:text-muted-foreground/50
+
+          prose-code:text-[12.5px] prose-code:text-foreground prose-code:bg-muted/70 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:font-normal prose-code:before:content-none prose-code:after:content-none
+
+          prose-a:text-primary prose-a:font-medium prose-a:no-underline hover:prose-a:underline
+
+          prose-hr:border-border/40 prose-hr:my-6
+
+          prose-blockquote:border-l-[3px] prose-blockquote:border-primary/30 prose-blockquote:bg-primary/[0.03] prose-blockquote:rounded-r-lg prose-blockquote:pl-4 prose-blockquote:pr-3 prose-blockquote:py-2 prose-blockquote:text-foreground/60 prose-blockquote:not-italic prose-blockquote:my-4
+
+          prose-table:my-4 prose-table:text-[12.5px] prose-table:w-full
+          prose-table:rounded-lg prose-table:overflow-hidden prose-table:border prose-table:border-border/40 prose-table:bg-card
+          prose-thead:bg-muted/60
+          prose-th:text-foreground prose-th:font-semibold prose-th:px-4 prose-th:py-2.5 prose-th:text-left prose-th:text-xs prose-th:uppercase prose-th:tracking-wider
+          prose-td:text-foreground/70 prose-td:px-4 prose-td:py-2.5 prose-td:border-t prose-td:border-border/30
+        ">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={markdownComponents}
+          >
+            {renderedContent}
+          </ReactMarkdown>
+        </div>
+
+        {/* Action bar */}
+        <div className="flex items-center gap-1 pt-1">
+          <button
+            onClick={handleCopy}
+            className="flex items-center gap-1 text-[11px] text-muted-foreground/50 hover:text-muted-foreground transition-colors px-2 py-1 rounded-md hover:bg-muted/50"
+            title="Copy response"
+          >
+            {copied ? (
+              <>
+                <Check className="w-3 h-3 text-emerald-500" />
+                <span className="text-emerald-500">Copied</span>
+              </>
+            ) : (
+              <>
+                <Copy className="w-3 h-3" />
+                <span>Copy</span>
+              </>
+            )}
+          </button>
+          {!hasAgentMeta && meta?.processingTime && (
+            <span className="text-[11px] text-muted-foreground/40 flex items-center gap-1 px-2">
+              <Zap className="w-3 h-3" />
+              {formatTime(meta.processingTime)}
             </span>
           )}
         </div>
@@ -471,12 +742,65 @@ function MessageBubble({
   );
 }
 
+function getLiveSourceCountsFromWorkers(workers?: string[]): SourceCounts {
+  if (!workers || workers.length === 0) {
+    return { tools: 0, sql: 0, docs: 0 };
+  }
+
+  let sql = 0;
+  let docs = 0;
+  let tools = 0;
+
+  for (const worker of workers) {
+    if (worker === "sql_query") {
+      sql += 1;
+      continue;
+    }
+    if (worker === "knowledge_base") {
+      docs += 1;
+      continue;
+    }
+    tools += 1;
+  }
+
+  return { tools, sql, docs };
+}
+
+function getSourceCountsFromMetadata(
+  meta?: ChatMessage["metadata"],
+): SourceCounts {
+  return {
+    tools: meta?.toolsUsed?.length || 0,
+    sql: meta?.sqlQueries?.length || 0,
+    docs: meta?.kbKeywords && meta.kbKeywords.length > 0 ? 1 : 0,
+  };
+}
+
+function formatSourceSummary(counts: SourceCounts): string {
+  return `Sources - Tools ${counts.tools} - SQL ${counts.sql} - Docs ${counts.docs}`;
+}
+
+// Short labels for tools in the reasoning badges
+function friendlyToolLabel(tool: string): string {
+  const map: Record<string, string> = {
+    get_file_overview: "File Overview",
+    get_logs: "Log Query",
+    get_errors_with_stack_traces: "Stack Traces",
+    get_exception_summary: "Exceptions",
+    detect_anomalies: "Anomalies",
+    get_pattern_examples: "Patterns",
+    get_correlated_events: "Correlations",
+    get_thread_context: "Thread Context",
+    get_time_series: "Time Series",
+    get_device_summary: "Device Health",
+    get_log_by_line_number: "Line Lookup",
+    list_session_files: "File List",
+  };
+  return map[tool] || tool.replace(/_/g, " ");
+}
+
 // Empty State Component
-function EmptyState({
-  setInput,
-}: {
-  setInput: (value: string) => void;
-}) {
+function EmptyState({ setInput }: { setInput: (value: string) => void }) {
   const examples = [
     {
       title: "Find a specific error",
@@ -498,8 +822,8 @@ function EmptyState({
 
   return (
     <div className="flex flex-col items-center justify-center py-12 text-center animate-in fade-in duration-500">
-      <div className="w-20 h-20 rounded-full bg-gradient-to-br from-primary/10 to-primary/5 flex items-center justify-center mb-6 ring-4 ring-primary/10 shadow-lg">
-        <FileSearch className="w-10 h-10 text-primary" />
+      <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-amber-100 to-orange-100 flex items-center justify-center mb-6 shadow-sm">
+        <Sparkles className="w-8 h-8 text-amber-600" />
       </div>
       <h3 className="text-xl font-semibold mb-2">Ready for Analysis</h3>
       <p className="text-sm text-muted-foreground mb-8 max-w-md leading-relaxed">
@@ -511,10 +835,14 @@ function EmptyState({
           <button
             key={i}
             onClick={() => setInput(example.query)}
-            className="w-full text-left p-4 rounded-xl bg-muted/40 border border-border/50 hover:border-primary/50 hover:bg-muted/60 hover:shadow-lg transition-all duration-200 cursor-pointer group"
+            className="w-full text-left p-4 rounded-xl bg-card border border-border/50 hover:border-primary/40 hover:shadow-md transition-all duration-200 cursor-pointer group"
           >
-            <p className="font-semibold text-sm text-foreground mb-1 group-hover:text-primary transition-colors">{example.title}</p>
-            <p className="text-xs text-muted-foreground">"{example.query}"</p>
+            <p className="font-semibold text-sm text-foreground mb-1 group-hover:text-primary transition-colors">
+              {example.title}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              &quot;{example.query}&quot;
+            </p>
           </button>
         ))}
       </div>
@@ -522,59 +850,4 @@ function EmptyState({
   );
 }
 
-// Suggestion Chips Component
-function SuggestionChips({
-  suggestions,
-  onSuggestionClick,
-}: {
-  suggestions: ProactiveInsight[];
-  onSuggestionClick: (query: string) => void;
-}) {
-  return (
-    <div className="w-full max-w-2xl mx-auto mb-4 animate-in fade-in duration-300">
-        <p className="text-xs text-muted-foreground font-semibold uppercase tracking-wide mb-3 text-center">
-          Proactive Insights
-        </p>
-        <div className="flex flex-wrap gap-3 justify-center">
-            {suggestions.map((suggestion, i) => (
-                <button
-                    key={i}
-                    onClick={() => onSuggestionClick(suggestion.query)}
-                    className="flex items-center gap-2 text-sm px-4 py-2.5 rounded-full bg-yellow-500/10 border border-yellow-500/30 hover:bg-yellow-500/20 hover:shadow-md transition-all duration-200 cursor-pointer group"
-                >
-                    <AlertCircle className="w-4 h-4 text-yellow-500" />
-                    <span className="text-yellow-300 group-hover:text-yellow-200">
-                        {suggestion.title}
-                    </span>
-                </button>
-            ))}
-        </div>
-    </div>
-  );
-}
 
-
-// Quick Action Button
-interface QuickActionButtonProps {
-  onClick: () => void;
-  icon: React.ReactNode;
-  children: React.ReactNode;
-}
-
-function QuickActionButton({
-  onClick,
-  icon,
-  children,
-}: QuickActionButtonProps) {
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={onClick}
-      className="text-xs h-8 gap-1.5 rounded-full hover:bg-muted/80 transition-all duration-200 border-border/50 hover:border-primary/30 hover:shadow-sm bg-transparent"
-    >
-      {icon}
-      {children}
-    </Button>
-  );
-}

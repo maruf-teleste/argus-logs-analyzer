@@ -1,8 +1,7 @@
 // app/api/sessions/[sessionId]/stats/route.ts
-// This route will provide key statistics for a log session.
 
 import { NextResponse } from 'next/server';
-import { getSessionStats } from '@/lib/db/queries';
+import { db } from '@/lib/db';
 
 export async function GET(
   request: Request,
@@ -13,14 +12,12 @@ export async function GET(
   const fileId = searchParams.get('fileId');
 
   try {
-    const stats = await getSessionStats(sessionId, fileId ? Number(fileId) : undefined);
+    const stats = db.getSessionStats(sessionId, fileId ? Number(fileId) : undefined);
 
     if (!stats || stats.total_logs === 0) {
       return NextResponse.json({ error: 'No data found for this session.' }, { status: 404 });
     }
-    
-    // Convert BigInt to number for JSON serialization
-    // Match frontend expectations: totalLines, totalErrors, totalWarnings
+
     const serializedStats = {
       totalLines: Number(stats.total_logs),
       totalErrors: Number(stats.error_count),

@@ -2,11 +2,12 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import * as parquet from "parquetjs-lite";
-import { createReadStream, statSync, unlinkSync } from "fs";
+import { createReadStream, statSync, unlinkSync, mkdirSync, copyFileSync } from "fs";
 import { createInterface } from "readline";
-import { pool } from "@/lib/db/batch-client";
+import { db } from "@/lib/db";
 import * as os from "os";
 import * as path from "path";
+import { PARQUET_DIR } from "@/lib/query/duckdb-client";
 import { deleteFromS3 } from "@/lib/storage/s3";
 // S3 Client
 const s3 = new S3Client({
@@ -68,28 +69,30 @@ export async function processLogFileToParquet(
   filePath: string,
   filename: string,
   fileHash: string,
-  onProgress?: (percent: number, stage: string) => void
+  onProgress?: (percent: number, stage: string, payload?: any) => void
 ): Promise<ProcessResult> {
   const fileSize = statSync(filePath).size;
   const fileSizeMB = fileSize / (1024 * 1024);
 
-  console.log(`📁 Processing: ${filename} (${fileSizeMB.toFixed(2)} MB)`);
+  console.log(`Processing: ${filename} (${fileSizeMB.toFixed(2)} MB)`);
 
   onProgress?.(5, "Creating file record...");
-  const fileRecord = await pool.query(
-    `INSERT INTO session_files (session_id, filename, file_hash, size_mb, upload_status)
-     VALUES ($1, $2, $3, $4, 'processing')
-     RETURNING file_id`,
-    [sessionId, filename, fileHash, fileSizeMB]
-  );
-  const fileId = fileRecord.rows[0].file_id;
+  let fileId: number;
+  try {
+    fileId = db.createFile(sessionId, filename, fileHash, fileSizeMB);
+  } catch (err: any) {
+    if (err?.code === "SQLITE_CONSTRAINT_FOREIGNKEY" || err?.message?.includes("FOREIGN KEY")) {
+      throw new Error(`Session ${sessionId} no longer exists. It may have been deleted during processing.`);
+    }
+    throw err;
+  }
   console.log(`   File ID: ${fileId}`);
 
   let uploadedS3Key: string | null = null;
   const parquetPath = path.join(os.tmpdir(), `${fileId}.parquet`);
 
   try {
-    // Parse and write Parquet
+    // Parse and write Parquet (rule engine evaluates each line)
     onProgress?.(10, "Parsing and converting to Parquet...");
     const stats = await parseAndWriteParquet(
       filePath,
@@ -99,55 +102,47 @@ export async function processLogFileToParquet(
       }
     );
 
-    // Upload to S3
-    onProgress?.(80, "Uploading to S3...");
+    // Copy to local cache
+    onProgress?.(80, "Saving parquet locally...");
     const parquetKey = `logs/${sessionId}/${fileId}.parquet`;
+    const localDir = path.join(PARQUET_DIR, "logs", sessionId);
+    mkdirSync(localDir, { recursive: true });
+    const localParquetPath = path.join(PARQUET_DIR, parquetKey);
+    copyFileSync(parquetPath, localParquetPath);
+    console.log(`   Saved locally: ${localParquetPath}`);
+
+    // Backup to S3
+    onProgress?.(85, "Backing up to S3...");
     await uploadToS3(parquetPath, parquetKey);
-    uploadedS3Key = parquetKey; // Track uploaded key
-    console.log(`   Uploaded to: s3://${BUCKET}/${parquetKey}`);
+    uploadedS3Key = parquetKey;
+    console.log(`   Backed up to: s3://${BUCKET}/${parquetKey}`);
 
     // Update database
     onProgress?.(90, "Saving metadata...");
-    await pool.query(
-      `UPDATE session_files SET
-        parquet_key = $1,
-        total_lines = $2,
-        parsed_lines = $3,
-        error_count = $4,
-        warn_count = $5,
-        info_count = $6,
-        time_range_start = $7,
-        time_range_end = $8,
-        devices = $9,
-        threads = $10,
-        components = $11,
-        exception_types = $12,
-        upload_status = 'ready',
-        processed_at = NOW()
-       WHERE file_id = $13`,
-      [
-        parquetKey,
-        stats.totalLines,
-        stats.parsedLines,
-        stats.errorCount,
-        stats.warnCount,
-        stats.infoCount,
-        stats.timeRangeStart,
-        stats.timeRangeEnd,
-        Array.from(stats.devices),
-        Array.from(stats.threads),
-        Array.from(stats.components),
-        Array.from(stats.exceptionTypes),
-        fileId,
-      ]
-    );
+    db.updateFileAfterProcessing(fileId, {
+      parquetKey,
+      totalLines: stats.totalLines,
+      parsedLines: stats.parsedLines,
+      errorCount: stats.errorCount,
+      warnCount: stats.warnCount,
+      infoCount: stats.infoCount,
+      timeRangeStart: stats.timeRangeStart,
+      timeRangeEnd: stats.timeRangeEnd,
+      devices: Array.from(stats.devices),
+      threads: Array.from(stats.threads),
+      components: Array.from(stats.components),
+      exceptionTypes: Array.from(stats.exceptionTypes),
+    });
 
     onProgress?.(100, "Complete");
-    console.log(`✅ Processing complete!`);
+    console.log(`Processing complete!`);
 
     return { fileId, parquetKey, stats };
   } catch (error) {
-    //  ROLLBACK: Delete S3 file if uploaded
+    //  ROLLBACK: Delete local + S3 file if created
+    const localFile = path.join(PARQUET_DIR, `logs/${sessionId}/${fileId}.parquet`);
+    try { unlinkSync(localFile); } catch { /* may not exist yet */ }
+
     if (uploadedS3Key) {
       try {
         await deleteFromS3(uploadedS3Key);
@@ -162,10 +157,7 @@ export async function processLogFileToParquet(
     }
 
     // Mark as error in DB
-    await pool.query(
-      `UPDATE session_files SET upload_status = 'error' WHERE file_id = $1`,
-      [fileId]
-    );
+    db.updateFileStatus(fileId, 'error');
 
     throw error;
   } finally {
@@ -225,68 +217,109 @@ async function parseAndWriteParquet(
 
   const writer = await parquet.ParquetWriter.openFile(schema, outputPath, {
     compression: "SNAPPY",
+    rowGroupSize: 5000, // Flush every 5K rows
   });
 
   // Read and parse
-  const fileStream = createReadStream(inputPath, { encoding: "utf-8" });
+  const fileStream = createReadStream(inputPath, {
+    encoding: "utf-8",
+    highWaterMark: 256 * 1024, // 256KB buffer
+  });
+
+  // Add error handlers to prevent unexpected closures
+  fileStream.on('error', (err) => {
+    console.error('[PARSER] File stream error:', err);
+  });
+
   const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
+
+  rl.on('error', (err) => {
+    console.error('[PARSER] Readline error:', err);
+  });
 
   let currentEntry: ParsedLogEntry | null = null;
   let stackTraceLines: string[] = [];
   let lineNumber = 0;
+  const BATCH_SIZE = 5000;
+  let batch: ParsedLogEntry[] = [];
 
-  for await (const line of rl) {
-    lineNumber++;
-    bytesProcessed += Buffer.byteLength(line, "utf-8") + 1;
-    stats.totalLines++;
+  const flushBatch = async () => {
+    if (batch.length > 0) {
+      for (const entry of batch) {
+        await writer.appendRow(entry);
+      }
+      stats.parsedLines += batch.length;
+      batch = [];
+    }
+  };
 
-    const parsed = parseLogLine(line, lineNumber);
+  try {
+    for await (const line of rl) {
+      lineNumber++;
+      bytesProcessed += Buffer.byteLength(line, "utf-8") + 1;
+      stats.totalLines++;
 
-    if (parsed) {
-      // Save previous entry
-      if (currentEntry) {
-        if (stackTraceLines.length > 0) {
-          currentEntry.has_stack_trace = true;
-          currentEntry.stack_trace = stackTraceLines.join("\n");
-          currentEntry.exception_class = extractExceptionClass(
-            stackTraceLines[0]
-          );
-          if (currentEntry.exception_class) {
-            stats.exceptionTypes.add(currentEntry.exception_class);
+      const parsed = parseLogLine(line, lineNumber);
+
+      if (parsed) {
+        // Save previous entry (now fully formed with stack trace)
+        if (currentEntry) {
+          if (stackTraceLines.length > 0) {
+            currentEntry.has_stack_trace = true;
+            currentEntry.stack_trace = stackTraceLines.join("\n");
+            currentEntry.exception_class = extractExceptionClass(
+              stackTraceLines[0]
+            );
+            if (currentEntry.exception_class) {
+              stats.exceptionTypes.add(currentEntry.exception_class);
+            }
+          }
+          batch.push(currentEntry);
+
+          if (batch.length >= BATCH_SIZE) {
+            await flushBatch();
           }
         }
-        await writer.appendRow(currentEntry);
-        stats.parsedLines++;
+
+        currentEntry = parsed;
+        stackTraceLines = [];
+
+        // Update stats
+        stats.threads.add(parsed.thread);
+        stats.components.add(parsed.component);
+        if (parsed.device_id) stats.devices.add(parsed.device_id);
+
+        if (parsed.severity === "ERROR") stats.errorCount++;
+        else if (parsed.severity === "WARN") stats.warnCount++;
+        else if (parsed.severity === "INFO") stats.infoCount++;
+
+        if (parsed.timestamp) {
+          const ts = new Date(parsed.timestamp);
+          if (!stats.timeRangeStart || ts < stats.timeRangeStart)
+            stats.timeRangeStart = ts;
+          if (!stats.timeRangeEnd || ts > stats.timeRangeEnd)
+            stats.timeRangeEnd = ts;
+        }
+      } else if (currentEntry && isStackTraceLine(line)) {
+        stackTraceLines.push(line);
+      } else if (line.trim()) {
+        stats.skippedLines++;
       }
 
-      currentEntry = parsed;
-      stackTraceLines = [];
-
-      // Update stats
-      stats.threads.add(parsed.thread);
-      stats.components.add(parsed.component);
-      if (parsed.device_id) stats.devices.add(parsed.device_id);
-
-      if (parsed.severity === "ERROR") stats.errorCount++;
-      else if (parsed.severity === "WARN") stats.warnCount++;
-      else if (parsed.severity === "INFO") stats.infoCount++;
-
-      if (parsed.timestamp) {
-        const ts = new Date(parsed.timestamp);
-        if (!stats.timeRangeStart || ts < stats.timeRangeStart)
-          stats.timeRangeStart = ts;
-        if (!stats.timeRangeEnd || ts > stats.timeRangeEnd)
-          stats.timeRangeEnd = ts;
+      // Progress every 50K lines
+      if (lineNumber % 50000 === 0) {
+        onProgress?.((bytesProcessed / totalBytes) * 100);
       }
-    } else if (currentEntry && isStackTraceLine(line)) {
-      stackTraceLines.push(line);
-    } else if (line.trim()) {
-      stats.skippedLines++;
     }
-
-    // Progress every 50K lines
-    if (lineNumber % 50000 === 0) {
-      onProgress?.((bytesProcessed / totalBytes) * 100);
+  } catch (err) {
+    console.error('[PARSER] Error during parsing loop:', err);
+    throw err;
+  } finally {
+    // Ensure readline is properly closed
+    try {
+      rl.close();
+    } catch {
+      // already closed
     }
   }
 
@@ -300,10 +333,10 @@ async function parseAndWriteParquet(
         stats.exceptionTypes.add(currentEntry.exception_class);
       }
     }
-    await writer.appendRow(currentEntry);
-    stats.parsedLines++;
+    batch.push(currentEntry);
   }
 
+  await flushBatch(); // Flush any remaining entries
   await writer.close();
   return stats;
 }
@@ -415,7 +448,7 @@ async function uploadToS3(filePath: string, key: string): Promise<void> {
     },
 
     queueSize: 4,
-    partSize: 10 * 1024 * 1024,
+    partSize: 20 * 1024 * 1024, // Increased to 20MB for large files
     leavePartsOnError: false,
   });
 

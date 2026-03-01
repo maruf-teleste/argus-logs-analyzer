@@ -7,10 +7,13 @@ import { X } from "lucide-react";
 
 interface Props {
   sessionId: string;
-  fileId?: number;
+  fileId?: string | number;
 }
 
 export function LogAnalysis({ sessionId, fileId }: Props) {
+  const normalizedFileId =
+    fileId === undefined ? undefined : Number.isNaN(Number(fileId)) ? undefined : Number(fileId);
+
   const [timeRange, setTimeRange] = useState<{
     start: string | null;
     end: string | null;
@@ -50,7 +53,7 @@ export function LogAnalysis({ sessionId, fileId }: Props) {
       {/* Histogram */}
       <AnomalyGrid
         sessionId={sessionId}
-        fileId={fileId}
+        fileId={normalizedFileId}
         onBarClick={handleBarClick}
         selectedStart={timeRange.start}
       />
@@ -58,7 +61,7 @@ export function LogAnalysis({ sessionId, fileId }: Props) {
       {/* Pattern Table */}
       <PatternTable
         sessionId={sessionId}
-        fileId={fileId}
+        fileId={normalizedFileId}
         startTime={timeRange.start}
         endTime={timeRange.end}
       />

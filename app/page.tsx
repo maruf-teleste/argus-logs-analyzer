@@ -1,7 +1,7 @@
 "use client";
 
 import type React from "react";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { SessionList } from "@/components/SessionCard";
@@ -18,6 +18,7 @@ import {
   BarChart3,
   Menu,
   X,
+  Loader2,
 } from "lucide-react";
 import type { Session } from "@/types/session";
 import {
@@ -29,8 +30,6 @@ import {
 } from "@/components/ui/card";
 import Image from "next/image";
 import { cn } from "@/lib/utils";
-import type { ProactiveInsight } from "@/lib/ai/proactive-insights";
-
 export default function LogAnalyzerDashboard() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSession, setSelectedSession] = useState<Session | null>(null);
@@ -38,7 +37,51 @@ export default function LogAnalyzerDashboard() {
   const [isLoadingSessions, setIsLoadingSessions] = useState(true);
   const [activeTab, setActiveTab] = useState<"chat" | "analysis">("chat");
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [proactiveSuggestions, setProactiveSuggestions] = useState<ProactiveInsight[]>([]);
+  const [isPreparingFile, setIsPreparingFile] = useState(false);
+
+  // Tracks whether an upload is in progress so we can poll independently
+  const uploadInProgressRef = useRef(false);
+
+  // Ref to avoid stale closure in callbacks captured by long-running XHRs
+  const selectedSessionRef = useRef(selectedSession);
+  selectedSessionRef.current = selectedSession;
+
+  // Fetch and normalize sessions from the API.
+  // Does NOT auto-select or set isLoadingSessions — callers control that.
+  const fetchSessions = useCallback(async (): Promise<Session[] | null> => {
+    try {
+      const response = await fetch("/api/sessions", { cache: "no-store" });
+      if (!response.ok) throw new Error("Failed to load sessions");
+      const data = await response.json();
+      return (data.sessions ?? []).map((s: any) => ({
+        ...s,
+        createdAt: new Date(s.createdAt),
+        expiresAt: new Date(s.expiresAt),
+        files: (s.files ?? []).map((f: any) => ({
+          ...f,
+          uploadedAt: f.uploadedAt ? new Date(f.uploadedAt) : undefined,
+        })),
+      }));
+    } catch (error) {
+      console.error("Error fetching sessions:", error);
+      return null;
+    }
+  }, []);
+
+  const loadSessions = async () => {
+    setIsLoadingSessions(true);
+    try {
+      const normalized = await fetchSessions();
+      if (!normalized) return undefined;
+      setSessions(normalized);
+      if (normalized.length > 0 && !selectedSessionRef.current) {
+        setSelectedSession(normalized[0]);
+      }
+      return normalized;
+    } finally {
+      setIsLoadingSessions(false);
+    }
+  };
 
   useEffect(() => {
     loadSessions();
@@ -47,62 +90,73 @@ export default function LogAnalyzerDashboard() {
   useEffect(() => {
     if (selectedSession) {
       loadSessionStats(selectedSession.id);
-      if (selectedSession.files.length > 0) {
-        loadProactiveSuggestions(selectedSession.id);
+      if (selectedSession.files.some((f) => f.status === "ready")) {
         setActiveTab("chat");
-      } else {
-        setProactiveSuggestions([]);
       }
     }
   }, [selectedSession]);
 
-  const loadSessions = async () => {
-    setIsLoadingSessions(true);
-    try {
-      const response = await fetch("/api/sessions");
-      if (!response.ok) throw new Error("Failed to load sessions");
-      const data = await response.json();
-      const normalized = (data.sessions ?? []).map((s) => ({
-        ...s,
-        createdAt: new Date(s.createdAt),
-        expiresAt: new Date(s.expiresAt),
-        files: (s.files ?? []).map((f) => ({
-          ...f,
-          uploadedAt: f.uploadedAt ? new Date(f.uploadedAt) : undefined,
-        })),
-      }));
-      setSessions(normalized);
-      // Automatically select the first session if available
-      if (normalized.length > 0 && !selectedSession) {
-        setSelectedSession(normalized[0]);
+  useEffect(() => {
+    const handleTabSwitch = (event: CustomEvent) => {
+      const { tab } = event.detail;
+      if (tab === "chat" || tab === "analysis") {
+        setActiveTab(tab);
       }
-      return normalized; // Return the sessions
-    } catch (error) {
-      console.error("Error loading sessions:", error);
-    } finally {
-      setIsLoadingSessions(false);
-    }
-  };
+    };
 
-  const loadProactiveSuggestions = async (sessionId: string) => {
-    try {
-      const response = await fetch(`/api/sessions/${sessionId}/summary`);
-      if (response.ok) {
-        const data = await response.json();
-        setProactiveSuggestions(data.insights || []);
-      } else {
-        setProactiveSuggestions([]);
+    window.addEventListener("switchTab", handleTabSwitch as EventListener);
+
+    return () => {
+      window.removeEventListener("switchTab", handleTabSwitch as EventListener);
+    };
+  }, []);
+
+  // ── Failsafe: independently poll for file readiness ──
+  // When an upload is in progress and the current session has no files,
+  // poll every 3s to detect when the file becomes ready. This catches
+  // cases where the SSE → callback chain fails through ALB.
+  useEffect(() => {
+    const session = selectedSession;
+    if (!session || session.files.some((f) => f.status === "ready")) return;
+
+    const interval = setInterval(async () => {
+      if (!uploadInProgressRef.current) return; // no upload, skip
+
+      try {
+        const res = await fetch(
+          `/api/sessions/${session.id}/upload-status?s3Key=check`,
+          { cache: "no-store" }
+        );
+        const data = await res.json();
+
+        if (data.status === "complete") {
+          console.log("[failsafe] File ready detected via polling");
+          uploadInProgressRef.current = false;
+
+          const allSessions = await fetchSessions();
+          if (allSessions) {
+            const updated = allSessions.find((s) => s.id === session.id);
+            if (updated && updated.files.some((f) => f.status === "ready")) {
+              setSessions(allSessions);
+              setSelectedSession(updated);
+              setIsPreparingFile(false);
+            }
+          }
+        }
+      } catch {
+        // Network error — next poll will retry
       }
-    } catch (error) {
-      console.error("Error fetching proactive suggestions:", error);
-      setProactiveSuggestions([]);
-    }
-  };
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [selectedSession, fetchSessions]);
 
   const loadSessionStats = async (sessionId: string) => {
-    if (!selectedSession || selectedSession.files.length === 0) return;
+    if (!selectedSession) return;
+    const readyFile = selectedSession.files.find((f) => f.status === "ready");
+    if (!readyFile) return;
     try {
-      const fileId = selectedSession.files[0].id;
+      const fileId = readyFile.id;
       const response = await fetch(
         `/api/sessions/${sessionId}/stats?fileId=${fileId}`
       );
@@ -146,17 +200,29 @@ export default function LogAnalyzerDashboard() {
 
   const deleteSession = async (sessionId: string) => {
     if (!confirm("Are you sure you want to delete this session?")) return;
+
+    // Optimistic UI update — remove immediately, revert on error
+    const previousSessions = sessions;
+    const previousSelected = selectedSession;
+
+    setSessions((prev) => {
+      const remaining = prev.filter((s) => s.id !== sessionId);
+      if (selectedSession?.id === sessionId) {
+        setSelectedSession(remaining.length > 0 ? remaining[0] : null);
+      }
+      return remaining;
+    });
+
     try {
       const response = await fetch(`/api/sessions/${sessionId}/delete`, {
         method: "DELETE",
       });
       if (!response.ok) throw new Error("Failed to delete session");
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
-      if (selectedSession?.id === sessionId) {
-        setSelectedSession(sessions.length > 1 ? sessions[0] : null);
-      }
     } catch (error) {
-      console.error("Error deleting session:", error);
+      console.error("Error deleting session, reverting:", error);
+      // Revert on failure
+      setSessions(previousSessions);
+      setSelectedSession(previousSelected);
     }
   };
 
@@ -168,15 +234,62 @@ export default function LogAnalyzerDashboard() {
   };
 
   const handleFileUploadComplete = async () => {
-    const allSessions = await loadSessions();
-    if (allSessions && selectedSession) {
-      const updatedSession = allSessions.find((s) => s.id === selectedSession.id);
-      setSelectedSession(updatedSession || null);
+    const current = selectedSessionRef.current;
+    if (!current) return;
 
-      // Fetch proactive suggestions
-      if (updatedSession) {
-        await loadProactiveSuggestions(updatedSession.id);
+    console.log("[upload-complete] Callback fired for session:", current.id);
+    uploadInProgressRef.current = false; // SSE chain worked, stop failsafe polling
+    setIsPreparingFile(true);
+
+    try {
+      // 1. Verify the file is fully processed and AI-ready before transitioning.
+      let fileReady = false;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        try {
+          const res = await fetch(
+            `/api/sessions/${current.id}/upload-status?s3Key=check`,
+            { cache: "no-store" }
+          );
+          const data = await res.json();
+          console.log(`[upload-complete] upload-status attempt ${attempt}:`, data.status);
+          if (data.status === "complete") { fileReady = true; break; }
+          if (data.status === "error") break;
+        } catch (err) {
+          console.warn("[upload-complete] upload-status fetch error:", err);
+        }
+        await new Promise((r) => setTimeout(r, 1000));
       }
+
+      if (!fileReady) {
+        console.warn("[upload-complete] File not ready after polling, proceeding anyway");
+      }
+
+      // 2. Fetch session data with retries — ALB might return stale data on first try
+      let updatedSession: Session | null = null;
+      for (let retry = 0; retry < 3; retry++) {
+          const allSessions = await fetchSessions();
+          if (allSessions) {
+            setSessions(allSessions);
+            const found = allSessions.find((s) => s.id === current.id);
+            if (found && found.files.some((f) => f.status === "ready")) {
+              updatedSession = found;
+              console.log("[upload-complete] Session found with ready files");
+              break;
+            }
+          }
+        console.log(`[upload-complete] Retry ${retry + 1}: session has no files yet, waiting...`);
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+
+      if (updatedSession) {
+        setSelectedSession(updatedSession);
+      } else {
+        console.error("[upload-complete] Failed to find session with files after retries");
+        // Failsafe polling effect will continue trying
+        uploadInProgressRef.current = true;
+      }
+    } finally {
+      setIsPreparingFile(false);
     }
   };
 
@@ -247,8 +360,12 @@ export default function LogAnalyzerDashboard() {
         </header>
 
         {selectedSession ? (
+          (() => {
+            const readyFile = selectedSession.files.find((f) => f.status === "ready");
+            const hasReadyFile = Boolean(readyFile);
+            return (
           <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as any)} className="flex-1 flex flex-col min-h-0">
-            {selectedSession.files.length > 0 && (
+            {hasReadyFile && (
               <div className="px-6 py-4 border-b border-border/60">
                 <TabsList>
                   <TabsTrigger value="chat" className="gap-2">
@@ -265,7 +382,17 @@ export default function LogAnalyzerDashboard() {
             )}
 
             <div className="flex-1 overflow-y-auto">
-              {selectedSession.files.length === 0 ? (
+              {isPreparingFile ? (
+                <div className="flex flex-col items-center justify-center h-full text-center p-6 gap-4">
+                  <Loader2 className="w-8 h-8 text-primary animate-spin" />
+                  <div>
+                    <h3 className="text-lg font-semibold">Preparing your analysis...</h3>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      Verifying file is ready for AI queries
+                    </p>
+                  </div>
+                </div>
+              ) : !hasReadyFile ? (
                 <div className="flex flex-col items-center justify-center h-full text-center p-6">
                     <Card className="w-full max-w-lg">
                         <CardHeader>
@@ -277,6 +404,7 @@ export default function LogAnalyzerDashboard() {
                         <CardContent>
                             <FileUpload
                                 sessionId={selectedSession.id}
+                                onUploadStart={() => { uploadInProgressRef.current = true; }}
                                 onUploadComplete={handleFileUploadComplete}
                                 onUploadError={(err) => console.error("Upload error:", err)}
                             />
@@ -288,8 +416,6 @@ export default function LogAnalyzerDashboard() {
                   <TabsContent value="chat" className="h-full">
                     <ChatInterface
                       sessionId={selectedSession.id}
-                      proactiveSuggestions={proactiveSuggestions}
-                      clearSuggestions={() => setProactiveSuggestions([])}
                     />
                   </TabsContent>
                   <TabsContent value="analysis" className="p-6">
@@ -312,13 +438,15 @@ export default function LogAnalyzerDashboard() {
                     )}
                     <LogAnalysis
                       sessionId={selectedSession.id}
-                      fileId={selectedSession.files[0].id}
+                      fileId={readyFile?.id}
                     />
                   </TabsContent>
                 </>
               )}
             </div>
           </Tabs>
+            );
+          })()
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
             <div className="flex items-center gap-4 mb-4">

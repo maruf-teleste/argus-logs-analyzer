@@ -1,7 +1,15 @@
 // lib/query/duckdb-client.ts
 import * as duckdb from "duckdb";
-import { pool } from "@/lib/db/batch-client";
+import * as path from "path";
+import * as fs from "fs";
+import { db as appDb } from "@/lib/db";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
+
+// Local parquet cache directory — DuckDB reads from here, not S3
+export const PARQUET_DIR = path.resolve(process.env.PARQUET_DIR || "./data/parquet");
 
 interface AnomalyDetectionParams {
   file_id: number;
@@ -101,9 +109,12 @@ export async function runQuery<T = any>(sql: string): Promise<T[]> {
   return new Promise(async (resolve, reject) => {
     try {
       const connection = await getConnection();
-      connection.all(sql, (err: Error | null, rows: T[]) => {
-        if (err) reject(err);
-        else resolve(convertBigInts(rows || []));
+      connection.all(sql, (err: Error | null, rows: any) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(convertBigInts((rows || []) as any[]) as T[]);
       });
     } catch (e) {
       reject(e);
@@ -112,22 +123,106 @@ export async function runQuery<T = any>(sql: string): Promise<T[]> {
 }
 
 // ============================================================
-// GET PARQUET PATH FROM FILE ID
+// GET PARQUET PATH FROM FILE ID (with S3 recovery)
 // ============================================================
 
+const s3 = new S3Client({ region: process.env.AWS_REGION || "eu-north-1" });
+const BUCKET = process.env.S3_BUCKET_NAME!;
+const recoveryPromises = new Map<string, Promise<string>>();
+
 async function getParquetKey(fileId: number): Promise<string> {
-  const result = await pool.query(
-    `SELECT parquet_key FROM session_files WHERE file_id = $1`,
-    [fileId]
-  );
-  if (!result.rows[0]?.parquet_key) {
+  const key = appDb.getParquetKey(fileId);
+  if (!key) {
     throw new Error(`File ${fileId} not found or not processed`);
   }
-  return result.rows[0].parquet_key;
+  // Ensure file exists locally (auto-recover from S3 if container restarted)
+  await ensureLocalParquet(key);
+  return key;
 }
 
-function s3Path(key: string): string {
-  return `s3://${process.env.S3_BUCKET_NAME}/${key}`;
+export async function getLocalParquetPath(fileId: number): Promise<string> {
+  const key = await getParquetKey(fileId);
+  return localPath(key);
+}
+
+function localPath(key: string): string {
+  return path.join(PARQUET_DIR, key).replace(/\\/g, "/");
+}
+
+/**
+ * Ensure parquet file exists locally. If missing (e.g. container restart),
+ * recover from S3 backup automatically.
+ */
+async function ensureLocalParquet(key: string): Promise<string> {
+  if (process.env.PARQUET_SAFE_RECOVERY !== "0") {
+    return ensureLocalParquetSafe(key);
+  }
+
+  const fp = localPath(key);
+  if (fs.existsSync(fp)) return fp;
+
+  console.log(`[RECOVERY] Local parquet missing: ${fp} — downloading from S3...`);
+  const dir = path.dirname(fp);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const response = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+  if (!response.Body) throw new Error(`S3 recovery failed: no body for ${key}`);
+
+  await pipeline(response.Body as Readable, fs.createWriteStream(fp));
+  console.log(`[RECOVERY] Restored from S3: ${fp}`);
+  return fp;
+}
+
+async function ensureLocalParquetSafe(key: string): Promise<string> {
+  const fp = localPath(key);
+
+  if (fs.existsSync(fp)) {
+    const stats = fs.statSync(fp);
+    if (stats.size > 0) return fp;
+    try {
+      fs.unlinkSync(fp);
+    } catch {
+      // ignore cleanup errors for corrupted/partial files
+    }
+  }
+
+  const inFlight = recoveryPromises.get(key);
+  if (inFlight) {
+    await inFlight;
+    return fp;
+  }
+
+  const recoveryPromise = (async (): Promise<string> => {
+    const dir = path.dirname(fp);
+    fs.mkdirSync(dir, { recursive: true });
+
+    const tmpPath = `${fp}.download-${process.pid}-${Date.now()}.tmp`;
+    try {
+      const response = await s3.send(
+        new GetObjectCommand({ Bucket: BUCKET, Key: key })
+      );
+      if (!response.Body) throw new Error(`S3 recovery failed: no body for ${key}`);
+
+      await pipeline(response.Body as Readable, fs.createWriteStream(tmpPath));
+      fs.renameSync(tmpPath, fp);
+      console.log(`[RECOVERY] Restored from S3 (safe): ${fp}`);
+      return fp;
+    } catch (err) {
+      if (fs.existsSync(tmpPath)) {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          // ignore temp cleanup errors
+        }
+      }
+      throw err;
+    } finally {
+      recoveryPromises.delete(key);
+    }
+  })();
+
+  recoveryPromises.set(key, recoveryPromise);
+  return recoveryPromise;
 }
 
 /* ============================================================
@@ -253,7 +348,7 @@ export async function detectAnomalies(fileId: number, params: any) {
   // 2. Get the ACTUAL file limits first
   const meta = await runQuery(`
     SELECT MIN(timestamp) as min_ts, MAX(timestamp) as max_ts
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
   `);
   const fileMin = Number(meta[0].min_ts);
   const fileMax = Number(meta[0].max_ts);
@@ -321,7 +416,7 @@ export async function detectAnomalies(fileId: number, params: any) {
            WHEN timestamp BETWEEN ${bStart} AND ${bEnd} THEN 'baseline'
            ELSE 'outside'
         END as time_window
-      FROM read_parquet('${s3Path(key)}')
+      FROM read_parquet('${localPath(key)}')
       WHERE timestamp BETWEEN ${bStart} AND ${pEnd}
     ),
     stats AS (
@@ -423,7 +518,7 @@ export async function getPatternExamples(
         THEN substr(stack_trace, 1, 500) 
         ELSE NULL 
       END as stack_trace_preview
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE 
       (
         message ILIKE '%${safeFingerprint}%' 
@@ -447,7 +542,7 @@ export async function getPatternExamples(
     // but usually sufficient for context.
     const contextQuery = `
       SELECT line_number, timestamp, severity, thread, component, message
-      FROM read_parquet('${s3Path(key)}')
+      FROM read_parquet('${localPath(key)}')
       WHERE line_number BETWEEN ${targetLine - 5} AND ${targetLine + 5}
       ORDER BY line_number ASC
     `;
@@ -488,7 +583,7 @@ export async function getCorrelatedEvents(params: CorrelatedEventsParams) {
     SELECT
       line_number, timestamp, severity, thread, component, message,
       regexp_extract(message, '[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}') as trace_id
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE line_number = ${params.anchor_line}
   `;
   const anchor = (await runQuery(anchorQuery))[0];
@@ -536,7 +631,7 @@ export async function getCorrelatedEvents(params: CorrelatedEventsParams) {
       CASE WHEN line_number = ${
         params.anchor_line
       } THEN '>>> ANCHOR <<<' ELSE '' END as marker
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE ${correlationClause}
       AND line_number BETWEEN ${params.anchor_line - 100} AND ${
     params.anchor_line + 100
@@ -567,7 +662,7 @@ export async function getCorrelatedEvents(params: CorrelatedEventsParams) {
 
 export async function getFileOverviewEnhanced(fileId: number) {
   const key = await getParquetKey(fileId);
-  const fullPath = s3Path(key); // Helper to ensure consistent path usage
+  const fullPath = localPath(key); // Helper to ensure consistent path usage
 
   const query = `
     WITH categorized AS (
@@ -607,7 +702,7 @@ export async function getFileOverviewEnhanced(fileId: number) {
   // Get top components
   const componentsQuery = `
     SELECT component, COUNT(*) as count
-    FROM read_parquet('${fullPath}') -- ✅ FIX 2: Used fullPath (was missing s3Path wrapper)
+    FROM read_parquet('${fullPath}')
     GROUP BY component
     ORDER BY count DESC
     LIMIT 10
@@ -620,7 +715,7 @@ export async function getFileOverviewEnhanced(fileId: number) {
     interpretation: {
       noise_level:
         stats.noise_percentage > 90
-          ? "HIGH (>90% is routine telemetry - this is normal for EMS logs)"
+          ? "HIGH (>90% is routine telemetry - this is normal for logs)"
           : stats.noise_percentage > 70
           ? "MODERATE"
           : "LOW (unusual for EMS logs - investigate)",
@@ -682,7 +777,7 @@ export async function getLogs(
       device_id,
       has_stack_trace,
       exception_class
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     ${whereClause}
     ORDER BY line_number ${orderDir}
     LIMIT ${limit}
@@ -715,7 +810,7 @@ export async function getThreadContext(
       stack_trace,
       exception_class,
       CASE WHEN line_number = ${lineNumber} THEN true ELSE false END AS is_anchor
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE thread = '${thread}'
       AND line_number BETWEEN ${lineNumber - contextLines} AND ${
     lineNumber + contextLines
@@ -762,7 +857,7 @@ export async function getErrorsWithStackTraces(
       device_id,
       exception_class,
       stack_trace
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE ${conditions.join(" AND ")}
     ORDER BY timestamp DESC
     LIMIT ${options?.limit || 20}
@@ -794,7 +889,7 @@ export async function getLogByLineNumber(
       has_stack_trace,
       stack_trace,
       CASE WHEN line_number = ${lineNumber} THEN true ELSE false END AS is_anchor
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE line_number BETWEEN ${lineNumber - contextLines} AND ${
     lineNumber + contextLines
   }
@@ -838,7 +933,7 @@ export async function getTimeBasedContext(
         stack_trace,
         true AS is_anchor,
         0 AS sort_order
-      FROM read_parquet('${s3Path(key)}')
+      FROM read_parquet('${localPath(key)}')
       WHERE line_number = ${anchorLineNumber || -1}
     ),
     logs_before AS (
@@ -856,7 +951,7 @@ export async function getTimeBasedContext(
         stack_trace,
         false AS is_anchor,
         -1 AS sort_order
-      FROM read_parquet('${s3Path(key)}')
+      FROM read_parquet('${localPath(key)}')
       WHERE (timestamp < ${anchorTimestamp}
              OR (timestamp = ${anchorTimestamp} AND line_number < ${anchorLineNumber || -1}))
         ${threadClause}
@@ -878,7 +973,7 @@ export async function getTimeBasedContext(
         stack_trace,
         false AS is_anchor,
         1 AS sort_order
-      FROM read_parquet('${s3Path(key)}')
+      FROM read_parquet('${localPath(key)}')
       WHERE (timestamp > ${anchorTimestamp}
              OR (timestamp = ${anchorTimestamp} AND line_number > ${anchorLineNumber || -1}))
         ${threadClause}
@@ -905,7 +1000,7 @@ export async function getSeverityCounts(fileId: number): Promise<any[]> {
 
   const sql = `
     SELECT severity, COUNT(*) as count
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     GROUP BY severity
     ORDER BY count DESC
   `;
@@ -931,7 +1026,7 @@ export async function getDeviceSummary(
       MIN(timestamp) as first_seen,
       MAX(timestamp) as last_seen,
       COUNT(DISTINCT thread) as thread_count
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE device_id = '${deviceId}'
     GROUP BY device_id
   `;
@@ -941,26 +1036,66 @@ export async function getDeviceSummary(
 }
 
 /**
- * Get exception summary
+ * Get exception summary — returns both formal (stack-trace column) and
+ * text-extracted exceptions from message/stack_trace content
  */
-export async function getExceptionSummary(fileId: number): Promise<any[]> {
+export async function getExceptionSummary(fileId: number) {
   const key = await getParquetKey(fileId);
+  const fp = localPath(key);
 
-  const sql = `
-    SELECT 
-      exception_class,
-      COUNT(*) as count,
-      MIN(timestamp) as first_seen,
-      MAX(timestamp) as last_seen,
+  // 1. Formal: from exception_class column (existing logic)
+  const formal = await runQuery(`
+    SELECT exception_class, COUNT(*) as count,
+      MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
       COUNT(DISTINCT thread) as affected_threads,
       COUNT(DISTINCT device_id) as affected_devices
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${fp}')
     WHERE has_stack_trace = true AND exception_class IS NOT NULL
     GROUP BY exception_class
     ORDER BY count DESC
-  `;
+  `);
 
-  return runQuery(sql);
+  // 2. Text-extracted: scan message + stack_trace for exception patterns
+  const fromText = await runQuery(`
+    WITH extracted AS (
+      SELECT unnest(regexp_extract_all(
+        COALESCE(message,'') || ' ' || COALESCE(stack_trace,''),
+        '[A-Za-z][A-Za-z0-9_.]*(?:Exception|Error)'
+      )) as exc_name
+      FROM read_parquet('${fp}')
+    )
+    SELECT exc_name, COUNT(*) as count
+    FROM extracted
+    WHERE length(exc_name) > 5
+    GROUP BY exc_name
+    ORDER BY count DESC
+    LIMIT 30
+  `);
+
+  return { formal, fromText };
+}
+
+/**
+ * Get failing devices — top IPs/devices ranked by exception count
+ */
+export async function getFailingDevices(fileId: number) {
+  const key = await getParquetKey(fileId);
+  return runQuery(`
+    SELECT
+      ip_address,
+      COUNT(*) as total_events,
+      COUNT(*) FILTER (WHERE has_stack_trace = true) as exception_events,
+      COUNT(*) FILTER (WHERE severity = 'WARN') as warn_count,
+      COUNT(DISTINCT exception_class) as distinct_exceptions,
+      array_agg(DISTINCT exception_class)
+        FILTER (WHERE exception_class IS NOT NULL) as exception_types,
+      COUNT(DISTINCT thread) as affected_threads
+    FROM read_parquet('${localPath(key)}')
+    WHERE ip_address IS NOT NULL
+    GROUP BY ip_address
+    ORDER BY exception_events DESC
+    LIMIT 50
+  `);
 }
 
 /**
@@ -992,7 +1127,7 @@ export async function getTimeSeries(
       ${truncExpr} as time_bucket,
       severity,
       COUNT(*) as count
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     ${severityFilter}
     GROUP BY time_bucket, severity
     ORDER BY time_bucket ASC
@@ -1012,15 +1147,23 @@ export async function searchAcrossFiles(
     limit?: number;
   }
 ): Promise<any[]> {
-  // Get all parquet keys
-  const result = await pool.query(
-    `SELECT file_id, parquet_key, filename FROM session_files WHERE file_id = ANY($1)`,
-    [fileIds]
-  );
+  // Resolve and recover local parquet files first (important on ECS task restarts)
+  const parquetFiles = (
+    await Promise.all(
+      fileIds.map(async (id) => {
+        try {
+          const filePath = await getLocalParquetPath(id);
+          return `'${filePath}'`;
+        } catch {
+          return null;
+        }
+      })
+    )
+  ).filter(Boolean) as string[];
 
-  if (result.rows.length === 0) return [];
+  if (parquetFiles.length === 0) return [];
 
-  const files = result.rows.map((r) => `'${s3Path(r.parquet_key)}'`).join(", ");
+  const files = parquetFiles.join(", ");
 
   const conditions = [`message ILIKE '%${searchText}%'`];
   if (options?.severity?.length) {
@@ -1077,7 +1220,7 @@ export async function getTimelineHistogram(fileId: number) {
         AND NOT regexp_matches(message, '(?i)(${IGNORE_PATTERNS})')
         AND NOT regexp_matches(message, '(?i)(${CRITICAL_KEYWORDS})')
       ) as semantic_error_count
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE timestamp IS NOT NULL
     GROUP BY time_minute
     ORDER BY time_minute ASC
@@ -1188,7 +1331,7 @@ export async function getAnomalyGrid(
           THEN 80
           ELSE 0
         END as importance_score
-      FROM read_parquet('${s3Path(key)}')
+      FROM read_parquet('${localPath(key)}')
       WHERE timestamp >= ${startTs}
         AND timestamp < ${endTs}
         ${severityClause}
@@ -1237,7 +1380,7 @@ export async function getPatternSamples(
       component,
       thread,
       message
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE timestamp >= ${startTs}
       AND timestamp < ${endTs}
       -- Re-calculate fingerprint on the fly to match
@@ -1271,7 +1414,7 @@ export async function debugSemanticMatches(fileId: number) {
       message,
       severity,
       COUNT(*) as count
-    FROM read_parquet('${s3Path(key)}')
+    FROM read_parquet('${localPath(key)}')
     WHERE regexp_matches(message, '(?i)(${FAILURE_KEYWORDS})')
     GROUP BY message, severity
     ORDER BY count DESC

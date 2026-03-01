@@ -3,14 +3,13 @@ import {
   S3Client,
   DeleteObjectCommand,
   DeleteObjectsCommand,
+  ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 
+// Use default credential provider chain (works with ECS task role)
+// Falls back to environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) for local development
 const s3 = new S3Client({
-  region: process.env.AWS_REGION!,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-  },
+  region: process.env.AWS_REGION || "eu-north-1",
 });
 
 const BUCKET = process.env.S3_BUCKET_NAME!;
@@ -58,4 +57,24 @@ export async function deleteMultipleFromS3(keys: string[]): Promise<void> {
   }
 
   console.log(`Deleted ${keys.length} files from S3`);
+}
+
+/**
+ * List all object keys with a given prefix from S3
+ */
+export async function listObjectKeys(prefix: string): Promise<string[]> {
+  console.log(`🔍 Listing objects in S3 with prefix: ${prefix}`);
+  const command = new ListObjectsV2Command({
+    Bucket: BUCKET,
+    Prefix: prefix,
+  });
+
+  const { Contents } = await s3.send(command);
+  if (!Contents) {
+    return [];
+  }
+
+  const keys = Contents.map((c) => c.Key).filter((k): k is string => !!k);
+  console.log(`Found ${keys.length} objects with prefix ${prefix}`);
+  return keys;
 }

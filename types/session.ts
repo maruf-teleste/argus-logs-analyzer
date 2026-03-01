@@ -3,7 +3,7 @@ export interface LogFile {
   id: string;
   name: string;
   sizeMb?: number; // Changed from 'size' to match DB
-  status: "uploading" | "parsing" | "ready" | "error";
+  status: "uploading" | "processing" | "parsing" | "ready" | "error";
   progress: number;
   uploadedAt?: Date;
   totalLines?: number;
@@ -58,6 +58,12 @@ export interface ChatMessage {
     entities?: ExtractedEntities;
     resultCount?: number;
     processingTime?: number;
+    reasoning?: string;
+    toolsUsed?: string[];
+    sqlQueries?: string[];
+    kbKeywords?: string[];
+    workerCount?: number;
+    successCount?: number;
   };
 }
 
@@ -127,9 +133,18 @@ export interface UploadProgress {
   fileName: string;
   progress: number;
   stage:
+    | "compressing"
+    | "preparing"
+    | "starting"
     | "uploading"
+    | "processing"
+    | "downloading"
     | "hashing"
     | "parsing"
+    | "writing_parquet"
+    | "uploading_to_s3"
+    | "saving_metadata"
+    | "findings"
     | "inserting"
     | "complete"
     | "error";
